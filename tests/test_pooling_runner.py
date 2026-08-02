@@ -25,6 +25,7 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
+from vllm_tt_plugin import pooling_runner as pooling_runner_mod
 from vllm_tt_plugin.pooling_runner import TTPoolingModelRunner
 
 # The worker module pulls in the full generative stack (scheduler, lane
@@ -267,6 +268,29 @@ def test_pooler_present_handles_list_pooler_output():
 
 
 @_requires_pool_metadata
+def test_pool_via_model_pooler_drives_a_real_vllm_pooler():
+    # Integration guard against the metadata/layout bug: feed a REAL vLLM
+    # Pooler (LastPool) a flattened ``[total_tokens, hidden]`` with prompt_lens
+    # != 1, and assert the runner's PoolingMetadata makes it pick each request's
+    # true last token. A batched/pooled layout (or a wrong cursor) would misindex
+    # here even though the stub-based tests still pass.
+    from vllm.model_executor.layers.pooler.seqwise.methods import LastPool
+
+    runner = _bare_runner()
+    # Two requests, 3 and 2 real tokens, concatenated on the flat token axis.
+    reqs = [_req("a", [10, 11, 12]), _req("b", [20, 21])]
+    # Row i of the flat hidden is filled with i, so the last token of req a is
+    # row 2 and the last token of req b is row 4.
+    hidden = torch.arange(5, dtype=torch.float32).reshape(5, 1).repeat(1, 4)
+
+    out = runner._pool_via_model_pooler(LastPool(), hidden, reqs)
+
+    assert len(out) == 2
+    assert torch.allclose(out[0], torch.full((4,), 2.0))  # req a last token
+    assert torch.allclose(out[1], torch.full((4,), 4.0))  # req b last token
+
+
+@_requires_pool_metadata
 def test_prompts_are_right_padded_with_attention_mask():
     runner = _bare_runner()
     model = _FakeModel(width=4)
@@ -302,10 +326,36 @@ def test_finished_requests_are_evicted():
     assert "gone" not in runner.requests
 
 
-def test_supported_tasks_is_embed():
+def test_supported_pooling_tasks_delegate_to_model_pooler(monkeypatch):
+    # Upstream contract: the supported pooling tasks come from the model's
+    # Pooler, not a hard-coded runner list. ``is_pooling_model`` is patched to
+    # isolate the delegation from vLLM's full duck-typed model predicate.
+    monkeypatch.setattr(pooling_runner_mod, "is_pooling_model", lambda model: True)
     runner = _bare_runner()
+    model = _FakeModel(width=8)
+    model.pooler.get_supported_tasks = lambda: {"embed"}
+    runner.model = model
     assert runner.get_supported_pooling_tasks() == ["embed"]
     assert runner.get_supported_tasks() == ("embed",)
+
+
+def test_supported_pooling_tasks_report_reranker_tasks(monkeypatch):
+    # A cross-encoder / reranker model advertises classify/score, proving the
+    # runner no longer forces every pooling model onto the embed task.
+    monkeypatch.setattr(pooling_runner_mod, "is_pooling_model", lambda model: True)
+    runner = _bare_runner()
+    model = _FakeModel(width=1)
+    model.pooler.get_supported_tasks = lambda: {"classify", "score"}
+    runner.model = model
+    assert set(runner.get_supported_pooling_tasks()) == {"classify", "score"}
+
+
+def test_supported_pooling_tasks_empty_for_non_pooling_model(monkeypatch):
+    # A non-pooling model reports no pooling tasks (upstream returns []).
+    monkeypatch.setattr(pooling_runner_mod, "is_pooling_model", lambda model: False)
+    runner = _bare_runner()
+    runner.model = _FakeModel(width=4)
+    assert runner.get_supported_pooling_tasks() == []
 
 
 def test_warmup_is_noop():

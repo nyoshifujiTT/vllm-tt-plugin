@@ -31,6 +31,7 @@ import torch
 import torch.nn as nn
 import ttnn
 from vllm.config import VllmConfig
+from vllm.model_executor.models.interfaces_base import is_pooling_model
 from vllm.tasks import PoolingTask, SupportedTask
 from vllm.v1.outputs import ModelRunnerOutput
 
@@ -109,6 +110,31 @@ class TTPoolingModelRunner:
         new request whose full prompt is embedded in one pass. Sequences are
         right-padded to the batch's longest prompt with a 0/1 attention mask so
         the model can ignore pad positions.
+
+        TODO(tt-quirk, upstream-conformance): This builds a *batched*
+        ``[batch, max_seq_len]`` token tensor plus an explicit ``attention_mask``
+        and right-pads every sequence. That is NOT how upstream vLLM feeds
+        encoder / pooling models. Upstream flattens the batch into a single
+        ``[total_tokens]`` ``input_ids`` (+ ``positions``), passes NO
+        ``attention_mask``, and conveys per-request sequence boundaries through
+        ``AttentionMetadata.seq_lens`` so the attention kernel does
+        variable-length ("packed"/"varlen") attention -- each request attends
+        only to its own tokens, with no padding. See the encoder-model forward
+        signature ``forward(input_ids, positions, ...)`` (no mask) in vLLM
+        v0.24.0:
+        https://github.com/vllm-project/vllm/blob/v0.24.0/vllm/model_executor/models/bert.py
+
+        The proper end state is: this runner flattens inputs upstream-style and
+        the TT model consumes ``[total_tokens]`` + seq boundaries. We do NOT do
+        that yet because the TT XLM-RoBERTa encoder
+        (``models/demos/wormhole/bge_m3/tt/attention.py``) is built around a
+        fixed ``[B, 1, S, D]`` dense SDPA with a rank-4 ``[B, 1, 1, S]`` mask and
+        128-aligned seq_len; making it consume a flat/varlen layout is a full
+        rewrite of the attention core, and that encoder is SHARED with the bge-m3
+        embedding model, so the change would have to be co-designed with the
+        embedding owner. Until then, this batched+mask input is a deliberate,
+        localized TT special case kept here so the model runs; it is the only
+        place the runner departs from upstream's flat-token contract.
         """
         scheduled_reqs = scheduler_output.scheduled_new_reqs
         if not scheduled_reqs:
@@ -221,6 +247,17 @@ class TTPoolingModelRunner:
         live in the Pooler (an embed Pooler for embeddings, a ClassifierPooler
         for cross-encoder / reranker scoring), so the runner stays model- and
         directive-agnostic.
+
+        Hidden-states layout contract (upstream-standard): ``hidden_states`` is
+        the flattened, unpadded ``[total_tokens, hidden]`` tensor -- every
+        scheduled request's real tokens concatenated in request order, with no
+        batch dimension and no padding. The pooling cursor built here indexes
+        that flat token axis (``LastPool`` -> last_token_indices, ``CLSPool`` ->
+        first_token_indices, ``MeanPool`` -> per-request token spans), exactly
+        as the standard vLLM Pooler expects. ``model.forward`` is therefore
+        required to return this flat layout; a batched ``[B, S, D]`` (or already
+        pooled ``[B, hidden]``) tensor would be misindexed as if the batch axis
+        were the token axis.
         """
         import numpy as np
 
@@ -258,13 +295,20 @@ class TTPoolingModelRunner:
         return [out.cpu() if out is not None else None for out in raw_pooler_output]
 
     def get_supported_pooling_tasks(self) -> list[PoolingTask]:
-        """Pooling models expose the ``embed`` task.
+        """Advertise the pooling tasks the loaded model actually supports.
 
-        Cross-encoder / reranker models are served through the same embed path
-        (their per-request vector is a single relevance logit), so ``embed`` is
-        the task advertised for every TT pooling model.
+        Mirrors upstream ``GPUModelRunner.get_supported_pooling_tasks``: defer to
+        the model's ``pooler`` (``model.pooler.get_supported_tasks()``) instead
+        of hard-coding a task list in the runner. The supported tasks are a
+        property of the model's Pooler -- an embed Pooler reports ``embed``, a
+        cross-encoder / reranker ClassifierPooler reports ``classify`` /
+        ``score`` -- so the runner must not second-guess it. A non-pooling model
+        reports nothing.
         """
-        return ["embed"]
+        model = self.get_model()
+        if not is_pooling_model(model):
+            return []
+        return list(model.pooler.get_supported_tasks())
 
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         return tuple(self.get_supported_pooling_tasks())
