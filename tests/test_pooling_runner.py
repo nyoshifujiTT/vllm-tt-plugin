@@ -46,15 +46,23 @@ _requires_worker = pytest.mark.skipif(
 )
 
 
-def _bare_runner(max_num_seqs: int = 8, normalize=False) -> TTPoolingModelRunner:
+_UNSET = object()
+
+
+def _bare_runner(max_num_seqs: int = 8, normalize=_UNSET) -> TTPoolingModelRunner:
     """A runner wired just enough for the host-side methods (no device).
 
-    ``normalize`` seeds ``model_config.pooler_config.normalize``; ``None`` omits
-    the pooler_config entirely (to exercise the absent-config default).
+    ``normalize`` seeds ``model_config.pooler_config.normalize``. ``_UNSET``
+    (the default) omits ``pooler_config`` entirely; ``None`` builds a
+    ``pooler_config`` whose ``normalize`` is ``None`` (the vLLM default that
+    resolves to True for the embed task).
     """
     runner = TTPoolingModelRunner.__new__(TTPoolingModelRunner)
     runner.scheduler_config = SimpleNamespace(max_num_seqs=max_num_seqs)
-    pooler_config = None if normalize is None else SimpleNamespace(normalize=normalize)
+    if normalize is _UNSET:
+        pooler_config = None
+    else:
+        pooler_config = SimpleNamespace(normalize=normalize)
     runner.model_config = SimpleNamespace(pooler_config=pooler_config)
     runner.max_batch_size = max_num_seqs
     runner.requests = {}
@@ -62,11 +70,15 @@ def _bare_runner(max_num_seqs: int = 8, normalize=False) -> TTPoolingModelRunner
     return runner
 
 
-def _req(req_id: str, prompt_token_ids):
+def _req(req_id: str, prompt_token_ids, task=None):
+    """A scheduled request. ``task`` seeds ``pooling_params.task`` (the vLLM
+    per-request PoolingTask: ``"embed"`` for embeddings, ``"score"`` /
+    ``"classify"`` for cross-encoder reranking, ``None`` for a bare pooling
+    request that carries no task)."""
     return SimpleNamespace(
         req_id=req_id,
         prompt_token_ids=list(prompt_token_ids),
-        pooling_params=SimpleNamespace(),
+        pooling_params=SimpleNamespace(task=task),
     )
 
 
@@ -123,31 +135,54 @@ def test_reranker_single_logit_output():
     assert out.pooler_output[1].item() == 2.0
 
 
-def test_normalize_false_passes_through_raw_output():
-    # Reranker / raw-pooling path: normalize=False must NOT gate; the raw
-    # pooled output is returned unchanged.
+def test_embed_normalize_false_passes_through_raw_output():
+    # Embed request that explicitly opts out of normalization: normalize=False
+    # must NOT gate; the raw pooled vector is returned unchanged.
     runner = _bare_runner(normalize=False)
     runner.model = _FakeModel(width=4)
-    out = runner.execute_model(_scheduler_output([_req("a", [1, 2])]))
+    out = runner.execute_model(_scheduler_output([_req("a", [1, 2], task="embed")]))
     assert torch.allclose(out.pooler_output[0], torch.ones(4))
 
 
-def test_absent_pooler_config_defaults_to_no_normalize():
-    # No pooler_config at all -> treated as normalize=False (raw pass-through).
+def test_reranker_score_task_passes_through_even_without_explicit_normalize():
+    # Reranker safety: a cross-encoder request carries a "score" task and no
+    # explicit normalize (pooler_config.normalize is the vLLM default None).
+    # normalize is an embed-only directive, so the raw [B, 1] logit must pass
+    # through untouched -- it must NEVER be gated by the None default.
+    runner = _bare_runner(normalize=None)
+    runner.model = _FakeModel(width=1)
+    out = runner.execute_model(_scheduler_output([_req("q0", [1, 2, 3], task="score")]))
+    assert out.pooler_output[0].item() == 1.0
+
+
+def test_bare_pooling_request_without_task_passes_through():
+    # A pooling request with no task set (task=None) is not an embed request,
+    # so it must pass through raw regardless of pooler_config.normalize=None.
     runner = _bare_runner(normalize=None)
     runner.model = _FakeModel(width=2)
-    out = runner.execute_model(_scheduler_output([_req("a", [1])]))
+    out = runner.execute_model(_scheduler_output([_req("a", [1], task=None)]))
     assert out.pooler_output[0].shape == (2,)
 
 
-def test_normalize_true_is_rejected_until_implemented():
-    # Embedding path requests normalize=True. The TT pooling path bypasses
+def test_embed_normalize_none_defaults_to_normalize_and_is_rejected():
+    # Embed request with the vLLM default normalize=None. Per the PoolerConfig
+    # contract that default resolves to True, so an L2-normalized vector is
+    # required; it is not implemented, so fail loudly rather than silently
+    # returning an unnormalized embedding.
+    runner = _bare_runner(normalize=None)
+    runner.model = _FakeModel(width=8)
+    with pytest.raises(NotImplementedError, match="normaliz"):
+        runner.execute_model(_scheduler_output([_req("a", [1, 2, 3], task="embed")]))
+
+
+def test_embed_normalize_true_is_rejected_until_implemented():
+    # Embed path with explicit normalize=True. The TT pooling path bypasses
     # vLLM's Pooler, so L2 normalization must be applied here; it is not yet
     # implemented, so fail loudly instead of returning an unnormalized vector.
     runner = _bare_runner(normalize=True)
     runner.model = _FakeModel(width=8)
-    with pytest.raises(NotImplementedError, match="normalize"):
-        runner.execute_model(_scheduler_output([_req("a", [1, 2, 3])]))
+    with pytest.raises(NotImplementedError, match="normaliz"):
+        runner.execute_model(_scheduler_output([_req("a", [1, 2, 3], task="embed")]))
 
 
 def test_prompts_are_right_padded_with_attention_mask():

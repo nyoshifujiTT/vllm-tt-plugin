@@ -172,18 +172,27 @@ class TTPoolingModelRunner:
         # directly and does NOT run vLLM's standard Pooler, so any
         # PoolerConfig directive (normalize, softmax, ...) must be honoured here
         # or it is silently dropped. This runner currently honours only the
-        # no-op case: normalize=False (e.g. cross-encoder / reranker scoring,
-        # which must keep the raw logit and must never be L2-normalized).
-        # Embedding models request normalize=True and expect an L2-normalized
-        # vector; applying that is not implemented yet, so fail loudly rather
-        # than return a wrongly-unnormalized embedding.
-        if self._normalize_requested():
+        # no-op cases. L2 normalization is an *embed*-task directive: vLLM
+        # applies ``PoolerConfig.normalize`` only for the embed task, and its
+        # default is True when unset (``normalize=None``). Cross-encoder /
+        # reranker requests carry a classify/score task, for which normalize is
+        # irrelevant and the raw pooled logit must be preserved (L2-normalizing
+        # a [B, 1] score would destroy it). So gate strictly on the per-request
+        # task, never on ``normalize`` alone: an embed request whose normalize
+        # resolves to True needs an L2-normalized vector, which is not yet
+        # implemented -- fail loudly instead of returning a wrongly-unnormalized
+        # embedding; every non-embed (reranker) request passes through raw.
+        if any(
+            self._needs_l2_normalize(req_data.pooling_params)
+            for req_data in req_data_list
+        ):
             raise NotImplementedError(
-                "PoolerConfig.normalize=True is not yet honoured by "
+                "L2 normalization for embed pooling is not yet honoured by "
                 "TTPoolingModelRunner. The TT pooling path bypasses vLLM's "
-                "Pooler, so L2 normalization must be applied here; it is not "
-                "implemented. (normalize=False, e.g. cross-encoder scoring, "
-                "works and returns the raw pooled output.)"
+                "Pooler, so PoolerConfig.normalize (default True for the embed "
+                "task) must be applied here; it is not implemented. Non-embed "
+                "requests (e.g. cross-encoder / reranker scoring) are "
+                "unaffected and return the raw pooled output."
             )
         pooler_output = [outputs[i].cpu() for i in range(batch_size)]
 
@@ -211,17 +220,34 @@ class TTPoolingModelRunner:
             pooler_output=[],
         )
 
-    def _normalize_requested(self) -> bool:
-        """Whether the serving config asks for L2-normalized pooled output.
+    def _needs_l2_normalize(self, pooling_params) -> bool:
+        """Whether this request's pooled output must be L2-normalized.
 
-        Reads ``model_config.pooler_config.normalize`` (vLLM sets this from
-        ``--task embed`` / ``override_pooler_config``). Absent config defaults
-        to False so the reranker / raw-pooling path is never gated.
+        Normalization is an *embed*-task directive. vLLM applies
+        ``PoolerConfig.normalize`` only for the embed task and, per its
+        contract (``normalize: bool | None = None``, "Defaults to True"),
+        resolves an unset (``None``) value to True -- but that resolution
+        happens inside vLLM's Pooler, which the TT path bypasses, so the config
+        object still holds ``None`` here. Classify / score tasks (cross-encoder
+        reranker scoring) never normalize regardless of the flag, so the raw
+        pooled logit is preserved.
+
+        Returns True only for an ``embed`` request whose ``normalize`` is not
+        explicitly False (i.e. True or the default ``None``). Every non-embed
+        request -- and an embed request with ``normalize=False`` -- returns
+        False and passes through unchanged, so the reranker path is never
+        gated.
         """
-        pooler_config = getattr(self.model_config, "pooler_config", None)
-        if pooler_config is None:
+        if getattr(pooling_params, "task", None) != "embed":
             return False
-        return bool(getattr(pooler_config, "normalize", False))
+        pooler_config = getattr(self.model_config, "pooler_config", None)
+        normalize = (
+            getattr(pooler_config, "normalize", None)
+            if pooler_config is not None
+            else None
+        )
+        # vLLM contract: for embed, an unset (None) normalize defaults to True.
+        return normalize is not False
 
     def get_supported_pooling_tasks(self) -> list[PoolingTask]:
         """Pooling models expose the ``embed`` task.
