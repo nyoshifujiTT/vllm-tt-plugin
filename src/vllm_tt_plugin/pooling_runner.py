@@ -159,46 +159,32 @@ class TTPoolingModelRunner:
             return self._empty_output()
 
         assert self.model is not None, "Model not loaded. Call load_model() first."
-        batch_size = tokens.shape[0]
         outputs = self.model.forward(
             input_ids=tokens,
             attention_mask=attention_mask,
         )
-        # ``forward`` returns one vector per request: [batch, hidden] for
-        # embeddings or [batch, 1] for a cross-encoder logit. vLLM expects
-        # ``pooler_output`` as a list of one host tensor per request.
+        # Pooling contract: pooling directives (normalize, activation, pooling
+        # type, ...) are the responsibility of the model's ``pooler`` component,
+        # exactly as in upstream vLLM. The runner emits hidden states and
+        # delegates all pooling to ``model.pooler(hidden_states,
+        # pooling_metadata)``; it must never re-implement those directives.
         #
-        # Pooling-directive contract: the TT pooling path builds pooler_output
-        # directly and does NOT run vLLM's standard Pooler, so any
-        # PoolerConfig directive (normalize, softmax, ...) must be honoured here
-        # or it is silently dropped. This runner currently honours only the
-        # no-op cases. L2 normalization is an *embed*-task directive: vLLM
-        # applies ``PoolerConfig.normalize`` only for the embed task, and its
-        # default is True when unset (``normalize=None``). Cross-encoder /
-        # reranker requests carry a classify/score task, for which normalize is
-        # irrelevant and the raw pooled logit must be preserved (L2-normalizing
-        # a [B, 1] score would destroy it). So gate strictly on the per-request
-        # task, never on ``normalize`` alone: an embed request whose normalize
-        # resolves to True needs an L2-normalized vector, which is not yet
-        # implemented -- fail loudly instead of returning a wrongly-unnormalized
-        # embedding; every non-embed (reranker) request passes through raw.
-        if any(
-            self._needs_l2_normalize(req_data.pooling_params)
-            for req_data in req_data_list
-        ):
-            raise NotImplementedError(
-                "L2 normalization for embed pooling is not yet honoured by "
-                "TTPoolingModelRunner. The TT pooling path bypasses vLLM's "
-                "Pooler, so PoolerConfig.normalize (default True for the embed "
-                "task) must be applied here; it is not implemented. Non-embed "
-                "requests (e.g. cross-encoder / reranker scoring) are "
-                "unaffected and return the raw pooled output."
-            )
-        pooler_output = [outputs[i].cpu() for i in range(batch_size)]
+        # ``pooler`` is a required (non-Optional) member of every vLLM pooling
+        # model (``VllmModelForPooling.pooler: Pooler``), so upstream's pooling
+        # runner calls it unconditionally and so do we -- no ``pooler is None``
+        # fallback. An embed model carries a normalizing Pooler; a cross-encoder
+        # / reranker carries a ClassifierPooler that keeps the raw logit.
+        pooler = getattr(self.model, "pooler", None)
+        assert pooler is not None, (
+            "Pooling model exposes no pooler. Every vLLM pooling model must "
+            "define `pooler` (VllmModelForPooling.pooler: Pooler); the runner "
+            "delegates all pooling directives to it."
+        )
+        pooler_output = self._pool_via_model_pooler(pooler, outputs, req_data_list)
 
         req_ids = [req_data.req_id for req_data in req_data_list]
         req_id_to_index = {req_id: i for i, req_id in enumerate(req_ids)}
-        sampled_token_ids: list[list[int]] = [[] for _ in range(batch_size)]
+        sampled_token_ids: list[list[int]] = [[] for _ in req_data_list]
 
         return ModelRunnerOutput(
             req_ids=req_ids,
@@ -220,34 +206,56 @@ class TTPoolingModelRunner:
             pooler_output=[],
         )
 
-    def _needs_l2_normalize(self, pooling_params) -> bool:
-        """Whether this request's pooled output must be L2-normalized.
+    def _pool_via_model_pooler(
+        self, pooler, hidden_states: torch.Tensor, req_data_list: list
+    ) -> list:
+        """Delegate pooling to the model's ``pooler``, vLLM-standard style.
 
-        Normalization is an *embed*-task directive. vLLM applies
-        ``PoolerConfig.normalize`` only for the embed task and, per its
-        contract (``normalize: bool | None = None``, "Defaults to True"),
-        resolves an unset (``None``) value to True -- but that resolution
-        happens inside vLLM's Pooler, which the TT path bypasses, so the config
-        object still holds ``None`` here. Classify / score tasks (cross-encoder
-        reranker scoring) never normalize regardless of the flag, so the raw
-        pooled logit is preserved.
+        Mirrors upstream ``GPUModelRunner._pool``: build a
+        :class:`~vllm.v1.pool.metadata.PoolingMetadata` for the batch, call
+        ``pooler(hidden_states=..., pooling_metadata=...)`` and normalize the
+        :data:`~vllm.v1.outputs.PoolerOutput` (a tensor, or a per-request list)
+        into ``pooler_output`` (one host tensor per request).
 
-        Returns True only for an ``embed`` request whose ``normalize`` is not
-        explicitly False (i.e. True or the default ``None``). Every non-embed
-        request -- and an embed request with ``normalize=False`` -- returns
-        False and passes through unchanged, so the reranker path is never
-        gated.
+        The pooling task, normalize / activation policy and pooling type all
+        live in the Pooler (an embed Pooler for embeddings, a ClassifierPooler
+        for cross-encoder / reranker scoring), so the runner stays model- and
+        directive-agnostic.
         """
-        if getattr(pooling_params, "task", None) != "embed":
-            return False
-        pooler_config = getattr(self.model_config, "pooler_config", None)
-        normalize = (
-            getattr(pooler_config, "normalize", None)
-            if pooler_config is not None
-            else None
+        import numpy as np
+
+        # Imported lazily: this metadata module only exists on the canonical
+        # vLLM (v1) this plugin targets; the runner's device-free pass-through
+        # path must still import on older/mismatched vLLM.
+        from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
+
+        num_reqs = len(req_data_list)
+        prompt_lens_list = [len(req.prompt_token_ids) for req in req_data_list]
+        prompt_lens = torch.tensor(prompt_lens_list, dtype=torch.int64)
+
+        # Single-shot prefill pooling: every scheduled request is fully
+        # prefilled in one pass, so num_scheduled_tokens == seq_len == prompt
+        # length for each request.
+        pooling_metadata = PoolingMetadata(
+            prompt_lens=prompt_lens,
+            prompt_token_ids=None,
+            prompt_token_ids_cpu=None,
+            pooling_params=[req.pooling_params for req in req_data_list],
+            pooling_states=[PoolingStates() for _ in range(num_reqs)],
         )
-        # vLLM contract: for embed, an unset (None) normalize defaults to True.
-        return normalize is not False
+        pooling_metadata.build_pooling_cursor(
+            np.array(prompt_lens_list, dtype=np.int64),
+            seq_lens_cpu=prompt_lens,
+            device=hidden_states.device,
+        )
+
+        raw_pooler_output = pooler(
+            hidden_states=hidden_states, pooling_metadata=pooling_metadata
+        )
+        # PoolerOutput = torch.Tensor | list[torch.Tensor | None].
+        if isinstance(raw_pooler_output, torch.Tensor):
+            return [raw_pooler_output[i].cpu() for i in range(num_reqs)]
+        return [out.cpu() if out is not None else None for out in raw_pooler_output]
 
     def get_supported_pooling_tasks(self) -> list[PoolingTask]:
         """Pooling models expose the ``embed`` task.

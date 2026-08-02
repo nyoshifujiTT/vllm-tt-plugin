@@ -45,36 +45,45 @@ _requires_worker = pytest.mark.skipif(
     reason=f"vllm_tt_plugin.worker unavailable on this vLLM: {_WORKER_IMPORT_ERROR}",
 )
 
+# The standard-Pooler dispatch path builds a vllm.v1.pool.metadata.PoolingMetadata,
+# which only exists on the canonical vLLM (v1) this plugin targets. On a missing
+# or mismatched vLLM those tests are skipped; the pass-through path (no pooler)
+# needs none of it and always runs.
+try:
+    from vllm.v1.pool.metadata import PoolingMetadata as _PoolingMetadata  # noqa: F401
 
-_UNSET = object()
+    _POOL_METADATA_IMPORT_ERROR: Exception | None = None
+except Exception as exc:  # pragma: no cover - exercised only on vLLM skew
+    _POOL_METADATA_IMPORT_ERROR = exc
+
+_requires_pool_metadata = pytest.mark.skipif(
+    _POOL_METADATA_IMPORT_ERROR is not None,
+    reason=(
+        f"vllm.v1.pool.metadata unavailable on this vLLM: {_POOL_METADATA_IMPORT_ERROR}"
+    ),
+)
 
 
-def _bare_runner(max_num_seqs: int = 8, normalize=_UNSET) -> TTPoolingModelRunner:
+def _bare_runner(max_num_seqs: int = 8) -> TTPoolingModelRunner:
     """A runner wired just enough for the host-side methods (no device).
 
-    ``normalize`` seeds ``model_config.pooler_config.normalize``. ``_UNSET``
-    (the default) omits ``pooler_config`` entirely; ``None`` builds a
-    ``pooler_config`` whose ``normalize`` is ``None`` (the vLLM default that
-    resolves to True for the embed task).
+    Pooling directives now live in the model's ``pooler`` (see the dispatch
+    tests), so the runner itself needs no pooler-config state.
     """
     runner = TTPoolingModelRunner.__new__(TTPoolingModelRunner)
     runner.scheduler_config = SimpleNamespace(max_num_seqs=max_num_seqs)
-    if normalize is _UNSET:
-        pooler_config = None
-    else:
-        pooler_config = SimpleNamespace(normalize=normalize)
-    runner.model_config = SimpleNamespace(pooler_config=pooler_config)
+    runner.model_config = SimpleNamespace(pooler_config=None)
     runner.max_batch_size = max_num_seqs
     runner.requests = {}
     runner.model = None
     return runner
 
 
-def _req(req_id: str, prompt_token_ids, task=None):
+def _req(req_id: str, prompt_token_ids, task="embed"):
     """A scheduled request. ``task`` seeds ``pooling_params.task`` (the vLLM
     per-request PoolingTask: ``"embed"`` for embeddings, ``"score"`` /
-    ``"classify"`` for cross-encoder reranking, ``None`` for a bare pooling
-    request that carries no task)."""
+    ``"classify"`` for cross-encoder reranking). vLLM's PoolingMetadata requires
+    every request to carry a task, so it defaults to ``"embed"`` here."""
     return SimpleNamespace(
         req_id=req_id,
         prompt_token_ids=list(prompt_token_ids),
@@ -90,11 +99,18 @@ def _scheduler_output(new_reqs, finished=()):
 
 
 class _FakeModel:
-    """Returns a fixed-width vector per row so output shapes are checkable."""
+    """Returns a fixed-width vector per row so output shapes are checkable.
+
+    Carries an identity ``pooler`` by default: every vLLM pooling model exposes
+    a ``pooler`` (it is a required, non-Optional member), and the runner now
+    always delegates to it, so a bare model without one is not a valid input.
+    Tests that exercise a specific pooling policy override ``model.pooler``.
+    """
 
     def __init__(self, width: int):
         self.width = width
         self.seen = None
+        self.pooler = _StubIdentityPooler()
 
     def forward(self, input_ids, attention_mask):
         self.seen = (input_ids, attention_mask)
@@ -104,6 +120,62 @@ class _FakeModel:
         return out.expand(batch, self.width).contiguous()
 
 
+class _StubIdentityPooler:
+    """Stub Pooler that returns the pooled rows unchanged (applies no directive).
+
+    Represents the neutral case so batching / shape tests can run through the
+    standard ``model.pooler`` path without asserting a particular policy.
+    """
+
+    def __init__(self):
+        self.seen = None
+
+    def __call__(self, hidden_states, pooling_metadata):
+        self.seen = pooling_metadata
+        return hidden_states
+
+
+class _StubNormalizingPooler:
+    """Stub embed Pooler: L2-normalizes each row. Records the metadata it saw.
+
+    Stands in for vLLM's embed Pooler so tests can prove the runner delegates
+    normalization to the Pooler instead of doing it itself. Returns a stacked
+    [B, hidden] tensor (one valid PoolerOutput shape).
+    """
+
+    def __init__(self):
+        self.seen = None
+
+    def __call__(self, hidden_states, pooling_metadata):
+        self.seen = pooling_metadata
+        return torch.nn.functional.normalize(hidden_states, p=2, dim=-1)
+
+
+class _StubClassifierPooler:
+    """Stub ClassifierPooler: returns the raw [B, 1] logit unchanged (no
+    normalization), as a cross-encoder / reranker scoring Pooler would."""
+
+    def __init__(self):
+        self.seen = None
+
+    def __call__(self, hidden_states, pooling_metadata):
+        self.seen = pooling_metadata
+        return hidden_states
+
+
+class _StubListPooler:
+    """Stub Pooler returning a per-request list (the other valid PoolerOutput
+    shape) rather than a stacked tensor."""
+
+    def __init__(self):
+        self.seen = None
+
+    def __call__(self, hidden_states, pooling_metadata):
+        self.seen = pooling_metadata
+        return [row for row in hidden_states]
+
+
+@_requires_pool_metadata
 def test_embedding_output_lands_in_pooler_output():
     runner = _bare_runner()
     runner.model = _FakeModel(width=1024)
@@ -120,6 +192,7 @@ def test_embedding_output_lands_in_pooler_output():
     assert torch.allclose(out.pooler_output[1], torch.full((1024,), 2.0))
 
 
+@_requires_pool_metadata
 def test_reranker_single_logit_output():
     # Cross-encoder / reranker: forward returns [B, 1]; each request's vector is
     # a single relevance logit carried in pooler_output.
@@ -135,56 +208,65 @@ def test_reranker_single_logit_output():
     assert out.pooler_output[1].item() == 2.0
 
 
-def test_embed_normalize_false_passes_through_raw_output():
-    # Embed request that explicitly opts out of normalization: normalize=False
-    # must NOT gate; the raw pooled vector is returned unchanged.
-    runner = _bare_runner(normalize=False)
-    runner.model = _FakeModel(width=4)
-    out = runner.execute_model(_scheduler_output([_req("a", [1, 2], task="embed")]))
-    assert torch.allclose(out.pooler_output[0], torch.ones(4))
+@_requires_pool_metadata
+def test_pooler_present_is_invoked_and_owns_normalization():
+    # Standard path: when the model carries a Pooler, the runner delegates to
+    # it (building a PoolingMetadata) instead of applying any directive itself.
+    # The stub Pooler L2-normalizes, proving normalization is the Pooler's job.
+    runner = _bare_runner()
+    model = _FakeModel(width=4)
+    model.pooler = _StubNormalizingPooler()
+    runner.model = model
+    out = runner.execute_model(_scheduler_output([_req("a", [1, 2, 3], task="embed")]))
+    # Row 0 raw is ones(4) -> L2-normalized is 0.5 each; the Pooler ran.
+    assert torch.allclose(out.pooler_output[0], torch.full((4,), 0.5))
+    assert model.pooler.seen is not None  # pooler was actually called
 
 
-def test_reranker_score_task_passes_through_even_without_explicit_normalize():
-    # Reranker safety: a cross-encoder request carries a "score" task and no
-    # explicit normalize (pooler_config.normalize is the vLLM default None).
-    # normalize is an embed-only directive, so the raw [B, 1] logit must pass
-    # through untouched -- it must NEVER be gated by the None default.
-    runner = _bare_runner(normalize=None)
-    runner.model = _FakeModel(width=1)
-    out = runner.execute_model(_scheduler_output([_req("q0", [1, 2, 3], task="score")]))
+@_requires_pool_metadata
+def test_pooler_present_receives_correct_pooling_metadata():
+    # The runner must hand the Pooler a PoolingMetadata whose prompt_lens and
+    # per-request pooling_params match the batch (so the Pooler can dispatch on
+    # task etc.). A classifier-style stub returns the raw hidden per request.
+    runner = _bare_runner()
+    model = _FakeModel(width=1)
+    model.pooler = _StubClassifierPooler()
+    runner.model = model
+    out = runner.execute_model(
+        _scheduler_output(
+            [
+                _req("q0", [1, 2, 3, 4], task="score"),
+                _req("q1", [5], task="score"),
+            ]
+        )
+    )
+    meta = model.pooler.seen
+    assert list(meta.prompt_lens) == [4, 1]
+    assert [p.task for p in meta.pooling_params] == ["score", "score"]
+    # Classifier stub passes the [B, 1] logit through untouched (no normalize).
     assert out.pooler_output[0].item() == 1.0
+    assert out.pooler_output[1].item() == 2.0
 
 
-def test_bare_pooling_request_without_task_passes_through():
-    # A pooling request with no task set (task=None) is not an embed request,
-    # so it must pass through raw regardless of pooler_config.normalize=None.
-    runner = _bare_runner(normalize=None)
-    runner.model = _FakeModel(width=2)
-    out = runner.execute_model(_scheduler_output([_req("a", [1], task=None)]))
-    assert out.pooler_output[0].shape == (2,)
+@_requires_pool_metadata
+def test_pooler_present_handles_list_pooler_output():
+    # PoolerOutput may be a per-request list (not a stacked tensor); the runner
+    # must accept both and emit one host tensor per request.
+    runner = _bare_runner()
+    model = _FakeModel(width=2)
+    model.pooler = _StubListPooler()
+    runner.model = model
+    out = runner.execute_model(
+        _scheduler_output(
+            [_req("a", [1], task="embed"), _req("b", [2, 3], task="embed")]
+        )
+    )
+    assert len(out.pooler_output) == 2
+    assert torch.allclose(out.pooler_output[0], torch.ones(2))
+    assert torch.allclose(out.pooler_output[1], torch.full((2,), 2.0))
 
 
-def test_embed_normalize_none_defaults_to_normalize_and_is_rejected():
-    # Embed request with the vLLM default normalize=None. Per the PoolerConfig
-    # contract that default resolves to True, so an L2-normalized vector is
-    # required; it is not implemented, so fail loudly rather than silently
-    # returning an unnormalized embedding.
-    runner = _bare_runner(normalize=None)
-    runner.model = _FakeModel(width=8)
-    with pytest.raises(NotImplementedError, match="normaliz"):
-        runner.execute_model(_scheduler_output([_req("a", [1, 2, 3], task="embed")]))
-
-
-def test_embed_normalize_true_is_rejected_until_implemented():
-    # Embed path with explicit normalize=True. The TT pooling path bypasses
-    # vLLM's Pooler, so L2 normalization must be applied here; it is not yet
-    # implemented, so fail loudly instead of returning an unnormalized vector.
-    runner = _bare_runner(normalize=True)
-    runner.model = _FakeModel(width=8)
-    with pytest.raises(NotImplementedError, match="normaliz"):
-        runner.execute_model(_scheduler_output([_req("a", [1, 2, 3], task="embed")]))
-
-
+@_requires_pool_metadata
 def test_prompts_are_right_padded_with_attention_mask():
     runner = _bare_runner()
     model = _FakeModel(width=4)
@@ -209,6 +291,7 @@ def test_empty_schedule_returns_empty_output():
     assert out.sampled_token_ids == []
 
 
+@_requires_pool_metadata
 def test_finished_requests_are_evicted():
     runner = _bare_runner()
     runner.model = _FakeModel(width=2)
