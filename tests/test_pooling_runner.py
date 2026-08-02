@@ -46,10 +46,16 @@ _requires_worker = pytest.mark.skipif(
 )
 
 
-def _bare_runner(max_num_seqs: int = 8) -> TTPoolingModelRunner:
-    """A runner wired just enough for the host-side methods (no device)."""
+def _bare_runner(max_num_seqs: int = 8, normalize=False) -> TTPoolingModelRunner:
+    """A runner wired just enough for the host-side methods (no device).
+
+    ``normalize`` seeds ``model_config.pooler_config.normalize``; ``None`` omits
+    the pooler_config entirely (to exercise the absent-config default).
+    """
     runner = TTPoolingModelRunner.__new__(TTPoolingModelRunner)
     runner.scheduler_config = SimpleNamespace(max_num_seqs=max_num_seqs)
+    pooler_config = None if normalize is None else SimpleNamespace(normalize=normalize)
+    runner.model_config = SimpleNamespace(pooler_config=pooler_config)
     runner.max_batch_size = max_num_seqs
     runner.requests = {}
     runner.model = None
@@ -115,6 +121,33 @@ def test_reranker_single_logit_output():
     assert out.pooler_output[0].shape == (1,)
     assert out.pooler_output[0].item() == 1.0
     assert out.pooler_output[1].item() == 2.0
+
+
+def test_normalize_false_passes_through_raw_output():
+    # Reranker / raw-pooling path: normalize=False must NOT gate; the raw
+    # pooled output is returned unchanged.
+    runner = _bare_runner(normalize=False)
+    runner.model = _FakeModel(width=4)
+    out = runner.execute_model(_scheduler_output([_req("a", [1, 2])]))
+    assert torch.allclose(out.pooler_output[0], torch.ones(4))
+
+
+def test_absent_pooler_config_defaults_to_no_normalize():
+    # No pooler_config at all -> treated as normalize=False (raw pass-through).
+    runner = _bare_runner(normalize=None)
+    runner.model = _FakeModel(width=2)
+    out = runner.execute_model(_scheduler_output([_req("a", [1])]))
+    assert out.pooler_output[0].shape == (2,)
+
+
+def test_normalize_true_is_rejected_until_implemented():
+    # Embedding path requests normalize=True. The TT pooling path bypasses
+    # vLLM's Pooler, so L2 normalization must be applied here; it is not yet
+    # implemented, so fail loudly instead of returning an unnormalized vector.
+    runner = _bare_runner(normalize=True)
+    runner.model = _FakeModel(width=8)
+    with pytest.raises(NotImplementedError, match="normalize"):
+        runner.execute_model(_scheduler_output([_req("a", [1, 2, 3])]))
 
 
 def test_prompts_are_right_padded_with_attention_mask():

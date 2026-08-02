@@ -167,6 +167,24 @@ class TTPoolingModelRunner:
         # ``forward`` returns one vector per request: [batch, hidden] for
         # embeddings or [batch, 1] for a cross-encoder logit. vLLM expects
         # ``pooler_output`` as a list of one host tensor per request.
+        #
+        # Pooling-directive contract: the TT pooling path builds pooler_output
+        # directly and does NOT run vLLM's standard Pooler, so any
+        # PoolerConfig directive (normalize, softmax, ...) must be honoured here
+        # or it is silently dropped. This runner currently honours only the
+        # no-op case: normalize=False (e.g. cross-encoder / reranker scoring,
+        # which must keep the raw logit and must never be L2-normalized).
+        # Embedding models request normalize=True and expect an L2-normalized
+        # vector; applying that is not implemented yet, so fail loudly rather
+        # than return a wrongly-unnormalized embedding.
+        if self._normalize_requested():
+            raise NotImplementedError(
+                "PoolerConfig.normalize=True is not yet honoured by "
+                "TTPoolingModelRunner. The TT pooling path bypasses vLLM's "
+                "Pooler, so L2 normalization must be applied here; it is not "
+                "implemented. (normalize=False, e.g. cross-encoder scoring, "
+                "works and returns the raw pooled output.)"
+            )
         pooler_output = [outputs[i].cpu() for i in range(batch_size)]
 
         req_ids = [req_data.req_id for req_data in req_data_list]
@@ -192,6 +210,18 @@ class TTPoolingModelRunner:
             prompt_logprobs_dict={},
             pooler_output=[],
         )
+
+    def _normalize_requested(self) -> bool:
+        """Whether the serving config asks for L2-normalized pooled output.
+
+        Reads ``model_config.pooler_config.normalize`` (vLLM sets this from
+        ``--task embed`` / ``override_pooler_config``). Absent config defaults
+        to False so the reranker / raw-pooling path is never gated.
+        """
+        pooler_config = getattr(self.model_config, "pooler_config", None)
+        if pooler_config is None:
+            return False
+        return bool(getattr(pooler_config, "normalize", False))
 
     def get_supported_pooling_tasks(self) -> list[PoolingTask]:
         """Pooling models expose the ``embed`` task.
