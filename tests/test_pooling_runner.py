@@ -113,8 +113,14 @@ class _FakeModel:
         self.seen = None
         self.pooler = _StubIdentityPooler()
 
-    def forward(self, input_ids, attention_mask):
+    def forward(self, input_ids, attention_mask, return_full_hidden_states=False):
+        # The canonical runner always delegates to model.pooler, so it asks for
+        # the un-pooled hidden with return_full_hidden_states=True. The fake
+        # model returns the same fixed-width rows either way (the stub poolers
+        # decide what to do with them); it records the flag so a test can assert
+        # the runner requested full hidden states.
         self.seen = (input_ids, attention_mask)
+        self.seen_return_full_hidden_states = return_full_hidden_states
         batch = input_ids.shape[0]
         # Row i -> vector filled with (i + 1), so per-request identity is checkable.
         out = torch.arange(1, batch + 1, dtype=torch.float32).reshape(batch, 1)
@@ -288,6 +294,62 @@ def test_pool_via_model_pooler_drives_a_real_vllm_pooler():
     assert len(out) == 2
     assert torch.allclose(out[0], torch.full((4,), 2.0))  # req a last token
     assert torch.allclose(out[1], torch.full((4,), 4.0))  # req b last token
+
+
+@_requires_pool_metadata
+def test_runner_requests_full_hidden_states_from_forward():
+    # The canonical runner delegates all pooling to model.pooler, so it must ask
+    # forward for the un-pooled hidden with return_full_hidden_states=True (the
+    # fork runner leaves it default-off and gets the pooled pass-through).
+    runner = _bare_runner()
+    model = _FakeModel(width=4)
+    runner.model = model
+    runner.execute_model(_scheduler_output([_req("a", [1, 2, 3])]))
+    assert model.seen_return_full_hidden_states is True
+
+
+class _FakeTTNNHidden:
+    """Stand-in for a device (ttnn) hidden state whose ``.device`` is a method,
+    not a ``torch.device`` (matches ttnn.Tensor). Used to prove the runner
+    builds the pooling cursor without assuming a torch device."""
+
+    def __init__(self, rows):
+        self._rows = rows
+
+    def device(self):  # ttnn.Tensor.device is a method returning a MeshDevice
+        raise AssertionError("device() must not be called as a torch attribute")
+
+
+class _DeviceNativePooler:
+    """Stub TT-native pooler: indexes its own device hidden (ignores the torch
+    cursor's device) and returns one host logit per request."""
+
+    def __init__(self):
+        self.seen = None
+
+    def __call__(self, hidden_states, pooling_metadata):
+        self.seen = pooling_metadata
+        return [torch.tensor([float(r)]) for r in hidden_states._rows]
+
+
+@_requires_pool_metadata
+def test_pool_via_model_pooler_tolerates_non_torch_device_hidden():
+    # A device-native (ttnn-like) hidden exposes no torch ``.device``; the runner
+    # must still build a valid cursor (on CPU) and drive the pooler, which does
+    # its own on-device gather. The embedding path (real torch tensor) is
+    # exercised by test_pool_via_model_pooler_drives_a_real_vllm_pooler above.
+    runner = _bare_runner()
+    reqs = [_req("a", [10, 11, 12], task="score"), _req("b", [20, 21], task="score")]
+    pooler = _DeviceNativePooler()
+    hidden = _FakeTTNNHidden(rows=[2.0, 4.0])
+
+    out = runner._pool_via_model_pooler(pooler, hidden, reqs)
+
+    assert len(out) == 2
+    assert out[0].item() == 2.0
+    assert out[1].item() == 4.0
+    # The cursor was built (prompt_lens match) despite the non-torch hidden.
+    assert list(pooler.seen.prompt_lens) == [3, 2]
 
 
 @_requires_pool_metadata

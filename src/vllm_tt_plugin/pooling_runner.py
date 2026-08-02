@@ -185,9 +185,19 @@ class TTPoolingModelRunner:
             return self._empty_output()
 
         assert self.model is not None, "Model not loaded. Call load_model() first."
+        # Two-track forward contract (shared with the fork's pooling runner):
+        # a pooling model's ``forward`` defaults to returning its already-pooled
+        # output (an embedding, or a reranker logit) so the fork runner -- which
+        # never sets this flag -- keeps its byte-for-byte pass-through behaviour.
+        # This canonical runner always delegates pooling to ``model.pooler``, so
+        # it needs the *un-pooled* hidden states and asks for them explicitly
+        # with ``return_full_hidden_states=True``. Every pooling model on this
+        # runner accepts the flag (default off); a model that returns device
+        # (ttnn) hidden here keeps pooling on device (see _pool_via_model_pooler).
         outputs = self.model.forward(
             input_ids=tokens,
             attention_mask=attention_mask,
+            return_full_hidden_states=True,
         )
         # Pooling contract: pooling directives (normalize, activation, pooling
         # type, ...) are the responsibility of the model's ``pooler`` component,
@@ -248,6 +258,16 @@ class TTPoolingModelRunner:
         for cross-encoder / reranker scoring), so the runner stays model- and
         directive-agnostic.
 
+        Device tolerance: the standard cursor (``first/last_token_indices``) is a
+        torch index tensor placed on ``hidden_states.device``, which assumes a
+        torch tensor. A TT-native pooler may instead receive the model's device
+        (ttnn) hidden and index it on device itself (via ``ttnn.slice``); such a
+        tensor exposes no torch ``.device``. So the cursor device is taken from
+        ``hidden_states.device`` only when it is a real ``torch.device`` (the
+        embedding path, byte-for-byte unchanged) and falls back to CPU
+        otherwise, where the small index tensors are harmless to a pooler that
+        does its own on-device gather.
+
         Hidden-states layout contract (upstream-standard): ``hidden_states`` is
         the flattened, unpadded ``[total_tokens, hidden]`` tensor -- every
         scheduled request's real tokens concatenated in request order, with no
@@ -280,16 +300,27 @@ class TTPoolingModelRunner:
             pooling_params=[req.pooling_params for req in req_data_list],
             pooling_states=[PoolingStates() for _ in range(num_reqs)],
         )
+        # See "Device tolerance" above: use the tensor's torch device when it has
+        # one (embedding path unchanged), else build the cursor on CPU for a
+        # device-native (ttnn) hidden whose pooler indexes on device itself.
+        hidden_device = getattr(hidden_states, "device", None)
+        cursor_device = (
+            hidden_device
+            if isinstance(hidden_device, torch.device)
+            else torch.device("cpu")
+        )
         pooling_metadata.build_pooling_cursor(
             np.array(prompt_lens_list, dtype=np.int64),
             seq_lens_cpu=prompt_lens,
-            device=hidden_states.device,
+            device=cursor_device,
         )
 
         raw_pooler_output = pooler(
             hidden_states=hidden_states, pooling_metadata=pooling_metadata
         )
-        # PoolerOutput = torch.Tensor | list[torch.Tensor | None].
+        # PoolerOutput = torch.Tensor | list[torch.Tensor | None]. Pooler output
+        # is the small final result (embedding / logit) and is always host
+        # torch; ``.cpu()`` is a no-op if it is already on host.
         if isinstance(raw_pooler_output, torch.Tensor):
             return [raw_pooler_output[i].cpu() for i in range(num_reqs)]
         return [out.cpu() if out is not None else None for out in raw_pooler_output]
