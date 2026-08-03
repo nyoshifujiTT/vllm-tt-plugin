@@ -265,9 +265,18 @@ class TTModelRunner:
         )
 
     def get_supported_generation_tasks(self) -> list[GenerationTask]:
-        # TT backend currently supports text generation only.
-        # (No transcription support yet.)
-        return ["generate"]
+        # TT backend supports text generation, plus transcription for models
+        # that implement SupportsTranscription (e.g. Qwen3-ASR). Mirror the GPU
+        # runner: inspect the (loaded) model instance for supports_transcription.
+        from vllm.model_executor.models import supports_transcription
+
+        tasks: list[GenerationTask] = ["generate"]
+        model = getattr(self, "model", None)
+        if model is not None and supports_transcription(model):
+            if getattr(model, "supports_transcription_only", False):
+                return ["transcription"]
+            tasks.append("transcription")
+        return tasks
 
     def get_supported_pooling_tasks(self) -> list[PoolingTask]:
         # TT backend does not support pooling/embedding tasks yet.
@@ -698,9 +707,9 @@ class TTModelRunner:
         self.input_batch.refresh_logitsprocs()
 
     def _validate_mm_feature(self, mm_feature: MultiModalFeatureSpec) -> None:
-        """Validate the multimodal feature is an image."""
-        if mm_feature.modality != "image":
-            raise NotImplementedError("Only images are supported for now")
+        """Validate the multimodal feature is an image or audio."""
+        if mm_feature.modality not in ("image", "audio"):
+            raise NotImplementedError("Only image and audio modalities are supported")
 
     def _gather_multi_modal_inputs(
         self, req_indices: list[int] | None = None
@@ -739,6 +748,8 @@ class TTModelRunner:
         multi_modal_kwargs: dict[str, Any] = {
             "pixel_values": [],
             "image_grid_thw": [],
+            "input_audio_features": [],
+            "audio_feature_lengths": [],
         }
 
         if req_indices is None:
@@ -752,24 +763,40 @@ class TTModelRunner:
             if not req_state.mm_features:
                 multi_modal_kwargs["pixel_values"].append(None)
                 multi_modal_kwargs["image_grid_thw"].append(None)
+                multi_modal_kwargs["input_audio_features"].append(None)
+                multi_modal_kwargs["audio_feature_lengths"].append(None)
                 continue
 
             pv_array: list[torch.Tensor | None] = []
             image_grid_thw_array: list[torch.Tensor | None] = []
+            audio_feat_array: list[torch.Tensor | None] = []
+            audio_len_array: list[torch.Tensor | None] = []
             for mm_feature in req_state.mm_features:
                 self._validate_mm_feature(mm_feature)
                 item = mm_feature.data
                 if item is None:
                     pv_array.append(None)
                     image_grid_thw_array.append(None)
+                    audio_feat_array.append(None)
+                    audio_len_array.append(None)
                     continue
-                pv_array.append(item["pixel_values"].data)
-                image_grid_thw_array.append(
-                    item["image_grid_thw"].data if "image_grid_thw" in item else None
-                )
+                if mm_feature.modality == "audio":
+                    audio_feat_array.append(item["input_audio_features"].data)
+                    audio_len_array.append(
+                        item["audio_feature_lengths"].data
+                        if "audio_feature_lengths" in item
+                        else None
+                    )
+                else:
+                    pv_array.append(item["pixel_values"].data)
+                    image_grid_thw_array.append(
+                        item["image_grid_thw"].data if "image_grid_thw" in item else None
+                    )
 
-            multi_modal_kwargs["pixel_values"].append(pv_array)
-            multi_modal_kwargs["image_grid_thw"].append(image_grid_thw_array)
+            multi_modal_kwargs["pixel_values"].append(pv_array if pv_array else None)
+            multi_modal_kwargs["image_grid_thw"].append(image_grid_thw_array if image_grid_thw_array else None)
+            multi_modal_kwargs["input_audio_features"].append(audio_feat_array if audio_feat_array else None)
+            multi_modal_kwargs["audio_feature_lengths"].append(audio_len_array if audio_len_array else None)
 
         return multi_modal_kwargs
 
