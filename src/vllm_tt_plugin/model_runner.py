@@ -2287,6 +2287,12 @@ class TTModelRunner:
         engine calls this exactly once per ``execute_model`` that returned
         ``None``.
         """
+        if not self._pending_samples:
+            # Diagnostic (mirrors tenstorrent/vllm PR #446): a preceding
+            # execute_model raised before enqueuing a pending forward; returning
+            # None lets EngineCore re-raise the real execute_model exception via
+            # exec_model_fut.result() instead of masking it with IndexError.
+            return None
         finish = self._pending_samples.popleft()
         return finish(grammar_output)
 
