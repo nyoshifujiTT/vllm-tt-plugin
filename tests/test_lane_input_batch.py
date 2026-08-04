@@ -19,6 +19,7 @@ No device / ttnn execution required.
 from types import SimpleNamespace
 
 import torch
+import pytest
 from vllm.sampling_params import SamplingParams
 from vllm.v1.sample.logits_processor import AdapterLogitsProcessor, build_logitsprocs
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -31,6 +32,33 @@ from vllm_tt_plugin.input_batch import InputBatch, TTLaneInputBatch
 VOCAB = 64
 BLOCK = 16
 MAX_MODEL_LEN = 256
+
+
+@pytest.fixture(autouse=True)
+def _force_cpu_pin_memory_off(monkeypatch):
+    """Pin ``PIN_MEMORY`` off for these CPU-only host tests.
+
+    vLLM captures a module-level ``PIN_MEMORY`` once at import from
+    ``is_pin_memory_available()`` (``vllm.utils.torch_utils``), and several
+    sampling modules bind it by value (``from ... import PIN_MEMORY``), e.g.
+    ``vllm.v1.sample.ops.penalties``. Importing ``vllm_tt_plugin`` activates
+    ttnn, which can make that probe report an accelerator so ``PIN_MEMORY``
+    latches ``True`` -- and then ``torch.tensor(..., pin_memory=True,
+    device="cpu")`` / ``tensor.pin_memory()`` raises on this host, which has no
+    pinned-memory allocator. The latched value depends on test ordering
+    (whether a device-touching test imported these modules first), so these
+    unit tests fail only in the full suite. Force ``PIN_MEMORY`` off in every
+    already-imported vLLM module that exposes it, making the CPU-only sampling
+    path order-independent.
+    """
+    import sys
+
+    for name, module in list(sys.modules.items()):
+        if not name.startswith("vllm"):
+            continue
+        if getattr(module, "PIN_MEMORY", None):
+            monkeypatch.setattr(module, "PIN_MEMORY", False, raising=False)
+    yield
 
 
 class FirstPromptTokenBoost(AdapterLogitsProcessor):
