@@ -125,11 +125,21 @@ def test_streaming_assembles_name_and_args(parser: Gemma4ToolParser):
             prev, cur, chunk, [], [], [], request=None
         )
         if delta is not None and delta.tool_calls:
-            fn = delta.tool_calls[0].function or {}
-            if fn.get("name"):
-                name = fn["name"]
-            if fn.get("arguments"):
-                args_acc += fn["arguments"]
+            fn = delta.tool_calls[0].function
+            # ``DeltaToolCall.function`` is typed as ``DeltaFunctionCall | None``:
+            # the parser passes a ``model_dump()`` dict, but pydantic validation
+            # coerces it back into a ``DeltaFunctionCall`` model on assignment
+            # (upstream vllm==0.24.0). Read it via attributes, tolerating either
+            # a model or a mapping so the test does not depend on that coercion.
+            if fn is not None:
+                fn_name = fn.get("name") if isinstance(fn, dict) else fn.name
+                fn_args = (
+                    fn.get("arguments") if isinstance(fn, dict) else fn.arguments
+                )
+                if fn_name:
+                    name = fn_name
+                if fn_args:
+                    args_acc += fn_args
         prev = cur
 
     assert name == "get_weather"
