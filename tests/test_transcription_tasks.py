@@ -12,7 +12,6 @@ from types import SimpleNamespace
 
 import pytest
 
-from vllm_tt_plugin import model_runner as mr
 from vllm_tt_plugin.model_runner import TTModelRunner
 
 
@@ -30,7 +29,15 @@ def test_validate_mm_feature_accepts_audio_and_image():
 
 
 def _call_gen_tasks(monkeypatch, model, supports):
-    monkeypatch.setattr(mr, "supports_transcription", lambda m: supports)
+    # ``get_supported_generation_tasks`` imports ``supports_transcription``
+    # lazily from ``vllm.model_executor.models`` inside the method (to defer the
+    # vLLM submodule import), so patch it at that authoritative source rather
+    # than on the plugin module.
+    import vllm.model_executor.models as vllm_models
+
+    monkeypatch.setattr(
+        vllm_models, "supports_transcription", lambda m: supports, raising=False
+    )
     fake_self = SimpleNamespace(model=model)
     return TTModelRunner.get_supported_generation_tasks(fake_self)
 
