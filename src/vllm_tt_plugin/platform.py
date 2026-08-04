@@ -825,6 +825,40 @@ class TTPlatform(Platform):
         ), "TT backend does not support distributed execution"
         assert not vllm_config.lora_config, "LoRA is not supported for TT backend"
 
+        # Force eager execution: the TT backend runs the model through tt-metal
+        # (ttnn) inside the TT model runner, not through vLLM's torch.compile /
+        # Inductor / CUDA-graph pipeline. Leaving vLLM compilation enabled has no
+        # upside for TT (the compiled graph is never the hot path) and, on newer
+        # vLLM (>=0.24), the extra compilation passes (combo kernels, autotune,
+        # additional attention splitting ops) measurably slow the per-step host
+        # path that drives TT dispatch. Measured on Qwen3-ASR / p150 this roughly
+        # doubled decode throughput and halved prefill latency with identical
+        # outputs. Setting enforce_eager here (before the engine builds the
+        # compilation config) is equivalent to passing --enforce-eager, so
+        # callers never have to remember the flag.
+        if not vllm_config.model_config.enforce_eager:
+            logger.info(
+                "TT backend forces eager execution (enforce_eager=True); vLLM "
+                "torch.compile/CUDAGraph is unused by the ttnn hot path."
+            )
+            vllm_config.model_config.enforce_eager = True
+        # ``VllmConfig.__post_init__`` derives ``compilation_config.mode`` from
+        # ``enforce_eager`` *before* this platform hook runs, so flipping
+        # ``enforce_eager`` alone is not enough on an already-built config. Pin
+        # the compilation mode to NONE (and disable CUDA-graph capture) here so
+        # the ttnn hot path is never wrapped by a compiled/inductor graph,
+        # regardless of how the engine was invoked.
+        try:
+            from vllm.config import CompilationMode, CUDAGraphMode
+
+            vllm_config.compilation_config.mode = CompilationMode.NONE
+            vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+        except Exception:  # pragma: no cover - defensive across vLLM versions
+            logger.warning(
+                "Could not pin compilation_config.mode=NONE; relying on "
+                "enforce_eager alone.",
+            )
+
         # Device computes top-32 logprobs but the OpenAI API limits to 20
         MAX_TOP_K = 20
 
