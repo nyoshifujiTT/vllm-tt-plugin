@@ -295,12 +295,17 @@ def _collapse_parallel_config_to_single_process(parallel_config) -> None:
     parallel_config.data_parallel_external_lb = False
     parallel_config.data_parallel_hybrid_lb = False
 
-    # A single-process lane run owns one in-process worker, so pin the uniproc
-    # executor. Newer vLLM derives it from ``world_size_across_dp`` and latches
-    # "mp" from the user's --data_parallel_size before this hook runs; pinning
-    # "uni" keeps lane-DP single-process there too, so the worker's runtime
+    # A single-process lane run owns one in-process worker, so pin the TT
+    # single-process executor. Newer vLLM derives the backend from
+    # ``world_size_across_dp`` and latches "mp" from the user's
+    # --data_parallel_size before this hook runs; pinning the uniproc executor
+    # keeps lane-DP single-process there too, so the worker's runtime
     # ``num_gpu_blocks_override`` still reaches the engine's KV-cache sizing.
-    parallel_config.distributed_executor_backend = "uni"
+    # ``TTUniProcExecutor`` additionally restores the background decode
+    # read-back overlap that upstream ``UniProcExecutor`` dropped.
+    parallel_config.distributed_executor_backend = (
+        "vllm_tt_plugin.executor.TTUniProcExecutor"
+    )
 
 
 def _convert_gather_dp_to_lanes(vllm_config: "VllmConfig", model_class=None) -> None:
@@ -902,6 +907,20 @@ class TTPlatform(Platform):
         parallel_config = vllm_config.parallel_config
         if parallel_config.worker_cls == "auto":
             parallel_config.worker_cls = "vllm_tt_plugin.worker.TTWorker"
+        # Restore decode read-back overlap for the single-process path. Upstream
+        # vllm==0.24.0's ``UniProcExecutor`` finalizes an ``AsyncModelRunnerOutput``
+        # (the TT decode device->host read-back) inline on the engine thread,
+        # whereas the fork offloaded it to a background thread so it overlapped
+        # the next scheduling/device step. Inline finalization serializes every
+        # TT decode behind its own ~100ms logit read-back. Swap in the TT
+        # single-process executor (a UniProcExecutor subclass that re-adds the
+        # background output thread) whenever the backend is single-process; leave
+        # multi-process backends ("mp"/"ray"), which have their own async output
+        # handling, untouched.
+        if parallel_config.distributed_executor_backend in (None, "uni"):
+            parallel_config.distributed_executor_backend = (
+                "vllm_tt_plugin.executor.TTUniProcExecutor"
+            )
         parallel_config.engine_core_cls = "vllm.v1.engine.core.EngineCore"
         parallel_config.engine_core_proc_cls = "vllm.v1.engine.core.EngineCoreProc"
         parallel_config.engine_core_launcher_cls = (
