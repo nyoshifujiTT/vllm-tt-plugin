@@ -46,6 +46,7 @@ class TestDPModes:
                 data_parallel_backend="mp",
                 nnodes=1,
                 node_rank=0,
+                distributed_executor_backend=None,
             ),
             model_config=SimpleNamespace(
                 model="dummy",
@@ -69,6 +70,7 @@ class TestDPModes:
             lora_config=None,
             cache_config=SimpleNamespace(enable_prefix_caching=False),
             compilation_config=SimpleNamespace(mode=None, cudagraph_mode=None),
+            structured_outputs_config=SimpleNamespace(disable_any_whitespace=False),
         )
 
     @pytest.fixture
@@ -497,6 +499,17 @@ class TestDPModes:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        # ``get_device_indices`` is a fork-only vLLM helper; upstream
+        # vllm==0.24.0 renamed this path to
+        # ``get_physical_gpu_ids_for_local_dp_rank`` with a different signature.
+        # This assertion targets the fork's multi-host DP env-assignment API, so
+        # skip it cleanly on stock vLLM rather than exercise an incompatible
+        # code path.
+        if not hasattr(engine_utils, "get_device_indices"):
+            pytest.skip(
+                "get_device_indices is fork-only; upstream vLLM uses "
+                "get_physical_gpu_ids_for_local_dp_rank"
+            )
         monkeypatch.setattr(engine_utils, "current_platform", TTPlatform)
         monkeypatch.setattr(
             TTPlatform,
