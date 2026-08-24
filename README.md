@@ -24,7 +24,6 @@ here. Nothing TT-specific needs to touch vLLM core.
 |   +-- model_runner.py      # TT model execution bridge
 |   +-- scheduler.py         # TT scheduling policy
 |   +-- lane_scheduler.py    # Single-process multi-lane (lane-DP) coordinator
-|   +-- engine.py            # TT engine core and DP engine processes
 |   +-- launcher.py          # tt-run / MPI launch integration
 |   +-- loader.py            # TT model loader
 |   +-- input_batch.py       # TT input-batch representation
@@ -45,8 +44,13 @@ for the appropriate tt-metal and vLLM commits.
 vLLM requires Python `>=3.10,<3.14`. Python 3.10.12 is the default `python3` on
 Ubuntu 22.04.
 
-The installation script builds vLLM `0.24.0` from source with
+The installation script builds vLLM `0.25.1` from source with
 `VLLM_TARGET_DEVICE=empty`. Other vLLM versions are not tested.
+
+To install against vLLM `0.24.0` instead, check out the `compat/vllm-0.24.0`
+tag, the last plugin state that targets it, and follow the same steps. Nothing
+is maintained on top of that tag. Pair it with the tt-metal commit the LLMs
+table lists for it.
 
 ## Environment Setup
 
@@ -56,7 +60,8 @@ If installing tt-metal from source, build it, create the virtual environment,
 and set the environment variables needed for tt-metal tests.
 
 Activate the environment where tt-metal is installed, then install vLLM
-and the TT plugin:
+and the TT plugin. Run it from the repository root, which the relative paths
+inside assume:
 
 ```bash
 source docs/install-vllm-tt.sh
@@ -66,6 +71,15 @@ The script installs vLLM with
 `VLLM_TARGET_DEVICE=empty` because `tt` platform is provided by this plugin
 at runtime. It then installs the plugin with a few dependencies.
 Most dependencies come from the active tt-metal env.
+
+The script also installs vLLM's dependency list itself, fetched from
+`requirements/common.txt` at the pinned vLLM tag, and installs vLLM with
+`--no-deps`. Resolving them the usual way pulls vLLM's CUDA dependency set
+(torch pinned, `flashinfer`, `tilelang`, `nvidia-*`), which would fight the
+tt-metal env over `torch` and add several GB. This means the script needs network
+access to `raw.githubusercontent.com` beyond the package index. When installing
+inside a container, also set `UV_NO_CACHE=1` to keep the uv cache out of the
+image layer.
 
 To install or refresh only the plugin package:
 
@@ -162,7 +176,7 @@ python examples/offline_inference_tt.py --measure_perf
 ```
 
 To run a different text model, set `MESH_DEVICE` to `N150`, `N300`, `T3K`, `TG`,
-or a mesh shape such as `"(4,8)"`, then pass `--model`:
+`BH-Galaxy`, or a mesh shape such as `"(4,8)"`, then pass `--model`:
 
 - Llama 3.1 8B: `--model "meta-llama/Llama-3.1-8B"`
 - Llama 3.2 1B: `--model "meta-llama/Llama-3.2-1B"`
@@ -176,7 +190,7 @@ or a mesh shape such as `"(4,8)"`, then pass `--model`:
 For Llama 3.1 8B on N150, set `--max_model_len 32768`; see the tt-metal model
 demo for context-length details.
 
-To run Llama 70B on Galaxy:
+To run Llama 70B on Wormhole Galaxy:
 
 ```bash
 MESH_DEVICE=TG \
@@ -184,18 +198,30 @@ LLAMA_DIR=<path-to-weights> \
 TT_LLAMA_TEXT_VER=llama3_70b_galaxy \
 python examples/offline_inference_tt.py \
   --model "meta-llama/Llama-3.1-70B-Instruct" \
-  --additional-config '{"tt": {"dispatch_core_axis": "col", "sample_on_device_mode": "all", "fabric_config": "FABRIC_1D_RING", "worker_l1_size": 1344544, "trace_region_size": 216580672}}'
+  --additional-config '{"tt": {"dispatch_core_axis": "col", "sample_on_device_mode": "all", "worker_l1_size": 1344544, "trace_region_size": 216580672}}'
 ```
 
-To run GPT-OSS 20B on Galaxy:
+To run GPT-OSS 20B on Wormhole Galaxy:
 
 ```bash
 MESH_DEVICE="(4,8)" \
 python examples/offline_inference_tt.py \
   --model "openai/gpt-oss-20b" \
-  --max_seqs_in_batch 1 \
-  --additional-config '{"tt": {"fabric_config": "FABRIC_1D_RING"}}'
+  --max_seqs_in_batch 1
 ```
+
+To run Qwen3-32B on Blackhole Galaxy:
+
+```bash
+MESH_DEVICE=TG \
+TT_QWEN3_TEXT_VER=qwen3_32b_galaxy \
+python examples/offline_inference_tt.py \
+  --model "Qwen/Qwen3-32B" \
+  --additional-config '{"tt": {"dispatch_core_axis": "col", "sample_on_device_mode": "all", "worker_l1_size": 1345000, "trace_region_size": 184915840}}'
+```
+
+Wormhole Galaxy defaults to `FABRIC_1D_RING` and Blackhole Galaxy defaults to
+`FABRIC_2D_TORUS_XY`, so those recipes do not need an explicit `fabric_config`.
 
 Run Llama 3.2 Vision on N300:
 
@@ -272,7 +298,7 @@ Common options:
 | `trace_region_size` | Trace region size for TT runtime tracing. |
 | `worker_l1_size` | Worker L1 size override. |
 | `l1_small_size` | Small L1 size override. |
-| `fabric_config` | Fabric config such as `DISABLED`, `FABRIC_1D`, `FABRIC_2D`, `FABRIC_1D_RING`, or `CUSTOM`. |
+| `fabric_config` | Fabric config such as `DISABLED`, `FABRIC_1D`, `FABRIC_2D`, `FABRIC_1D_RING`, `FABRIC_2D_TORUS_XY`, or `CUSTOM`. Any `ttnn.FabricConfig` name is accepted. Defaults: Wormhole Galaxy `FABRIC_1D_RING`, Blackhole Galaxy `FABRIC_2D_TORUS_XY`, other multi-device `FABRIC_1D`. |
 | `fabric_reliability_mode` | Fabric reliability mode, such as `STRICT_INIT` or `RELAXED_INIT`. |
 | `dispatch_core_axis` | Dispatch core axis, `row` or `col`. |
 | `always_compat_sampling` | Use vLLM's LogitProcessor and sampler path even when not required by the batch. Default: `false`. |
@@ -324,7 +350,9 @@ selects the TT-owned runtime classes through vLLM's extension points:
 The execution model matches TT hardware characteristics:
 
 - A TT step is either prefill-only or decode-only.
-- Chunked prefill is not (yet) used.
+- Token-chunked prefill is available for Gemma 4: a long prompt is split across
+  prefill steps and only the chunk that completes the prompt emits a token.
+  Every other model type keeps prefill unsplit.
 - Async scheduling overlaps decode submission with host-side scheduling when
   the model declares support.
 - For Galaxy-generator models (Llama3 70B, Qwen3-32B) and GPT-OSS,
@@ -334,8 +362,10 @@ The execution model matches TT hardware characteristics:
 - For other models, `--data_parallel_size N` uses standard multi-process DP:
   each DP rank runs an independent engine core with its own TT submesh,
   scheduler, and KV cache. Device groups are discovered at startup and assigned
-  via `TT_VISIBLE_DEVICES`. This is upstream vLLM's standard DP mechanism
-  (no gather/scatter; ranks are fully independent).
+  via `TT_VISIBLE_DEVICES`. A per-rank assignment is accepted only when it
+  exactly matches the discovered group; a conflicting GPU-style `--device-ids`
+  assignment fails before mesh creation. This is upstream vLLM's standard DP
+  mechanism (no gather/scatter; ranks are fully independent).
 
 For a deeper walk-through of the scheduling and execution model, read
 `docs/SCHEDULING.md`.
@@ -350,7 +380,7 @@ lanes.
 
 Serve them with the familiar `--data_parallel_size N --max_num_seqs M` flags;
 the TT backend transparently maps them to `N` in-process lanes. No config
-changes are needed:
+changes are needed. Wormhole Galaxy example (fabric defaults to `FABRIC_1D_RING`):
 
 ```bash
 MESH_DEVICE=TG \
@@ -361,15 +391,13 @@ python examples/server_example_tt.py \
   --data_parallel_size 4 \
   --max_num_seqs 8 \
   --async-scheduling \
-  --additional-config '{"tt": {"dispatch_core_axis": "col", "sample_on_device_mode": "all", "fabric_config": "FABRIC_1D_RING", "worker_l1_size": 1344544, "trace_region_size": 220000000}}'
+  --additional-config '{"tt": {"dispatch_core_axis": "col", "sample_on_device_mode": "all", "worker_l1_size": 1344544, "trace_region_size": 220000000}}'
 ```
 
 `--data_parallel_size 4 --max_num_seqs 8` runs `4` TT lanes of `8` requests
-each (`32` concurrent total); `--max_num_seqs` is the per-lane capacity. For
-these single-execute Galaxy models this replaces the gathered DP=4 setup they
-used historically, so there is nothing to migrate. This conversion is specific
-to the Galaxy generators; other model families still run `--data_parallel_size`
-as multi-process DP.
+each (`32` concurrent total); `--max_num_seqs` is the per-lane capacity. This
+conversion is specific to the Galaxy generators and GPT-OSS; other model
+families still run `--data_parallel_size` as multi-process DP.
 At startup the backend logs that it is running single-process lane-DP.
 
 ## Supported Model Families
@@ -419,13 +447,20 @@ source edit to the plugin. The built-in map above stays enabled by default; set
 `TTPlatform` rejects or adjusts unsupported feature combinations early, giving a
 clear error before anything reaches the device:
 
-- Tensor parallel and pipeline parallel execution are not supported.
+- Tensor parallel and pipeline parallel execution are provided by the models
+  internal implementation, not exposed at the vLLM level.
 - Speculative decoding is not currently supported.
 - LoRA is not currently supported.
-- Chunked prefill is disabled.
+- Chunked prefill is disabled for every model type except Gemma 4, and
+  `max_num_batched_tokens` is bumped to `max_model_len` when it is disabled.
+- Where chunked prefill is active, multimodal inputs are never split across a
+  chunk boundary.
 - Prompt logprobs are rejected at request validation time.
 - Prefix caching is enabled only for models that declare TT support for it.
 - Async decode overlap is enabled only for models that declare the capability.
+- Multi-host MPI data parallelism is not supported.
+- vLLM's V2 model runner. The plugin implements only the V1 model-runner
+  contract and pins `VLLM_USE_V2_MODEL_RUNNER=0`; setting it to `1` is refused.
 
 These are TT runtime characteristics, not vLLM plugin API limitations.
 
@@ -513,9 +548,10 @@ Models that do not opt in stay on the legacy `Generator` path: uniform
 single-group KV cache, one page table, and no behavioral change. The plugin only
 sends `page_tables_per_group` to model classes that expose `get_kv_cache_spec`.
 
-Hybrid models are not yet supported with `data_parallel_size > 1`; the DP
-merged-input gather path collapses to group 0 only. Use DP=1 with hybrid models
-until per-group DP gather lands.
+Hybrid models with `data_parallel_size > 1` have not been validated on
+hardware. Both DP modes carry the full per-group block tables (a standard-DP
+rank is an independent DP=1 engine, and lane-DP builds per-group tables for the
+merged batch), so there is no known blocker, but the combination is untested.
 
 
 ## Development Notes

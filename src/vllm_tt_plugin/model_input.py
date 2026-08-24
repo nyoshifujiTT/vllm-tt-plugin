@@ -65,7 +65,7 @@ class TTModelInput:
     input_positions: torch.Tensor
     prompt_lens: list[int] | None
     # Group-0 block table, retained as a tensor for back-compat with the
-    # many DP padding/gather/pack paths that read it as ``block_tables``.
+    # padding paths that read it as ``block_tables``.
     # Hybrid models must additionally consult ``block_tables_per_group``
     # below; legacy single-group models can continue to use this field.
     block_tables: torch.Tensor
@@ -87,7 +87,7 @@ class TTModelInput:
     tt_sampling_params: TTSamplingParams
     multi_modal_kwargs: dict[str, Any]
 
-    # For DP gather, this is true only if all ranks can sample on device.
+    # In lane mode this is true only if every lane can sample on device.
     perform_device_sampling: bool
 
     # always lists: single-element for non-DP, multi-element for DP
@@ -103,7 +103,7 @@ class TTModelInput:
     # allowed_token_ids_mask: list of (num_reqs, vocab_size) bool tensors
     allowed_token_ids_mask_list: list[torch.Tensor | None]
     # list of dicts mapping req_index -> generator for each DP rank
-    # only gathered when host sampling
+    # only populated when host sampling
     generators_list: list[dict[int, torch.Generator]]
     # max_num_logprobs: per-DP-rank list of max logprobs values
     # None means no logprobs, 0 means sampled token only
@@ -117,11 +117,16 @@ class TTModelInput:
     # previous step (used by on-device sampling).
     reset_batch: bool = False
 
-    # Per-rank slot remap from condense - remap[i]=j means slot i's data came
-    # from slot j. Identity when nothing moved. Shape: [total_B] (concat of
-    # per-rank [B] tensors for DP).
+    # Decode-only: device state slot remap - row i reads slot remap[i]. From
+    # ``_req_state_slot`` (lane mode: the condense-move remap). ``None`` means
+    # identity. Shape: [total_B].
     slot_remap: torch.Tensor | None = None
 
-    # Single-process DP prefill only: global stable slots supplied by the
-    # scheduler-owned step plan. ``None`` for non-DP, gathered-DP, and decode.
+    # Prefill-only: the device state slot each prefilling row writes to. Global for
+    # single-process DP (supplied by the scheduler-owned step plan), local otherwise.
     prefill_empty_slots: list[int] | None = None
+
+    # Prefill only: rows whose forward writes KV state but must not emit a
+    # sampled token, because more prompt tokens remain after this chunk.
+    # ``None`` for decode.
+    intermediate_prefill_mask: torch.Tensor | None = None
