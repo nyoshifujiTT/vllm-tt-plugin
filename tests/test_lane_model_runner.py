@@ -23,6 +23,7 @@ from vllm_tt_plugin.async_decode import (
 )
 from vllm_tt_plugin.input_batch import TTLaneInputBatch
 from vllm_tt_plugin.lane_scheduler import TTStepPlan
+from vllm_tt_plugin.model_input import TTSamplingParams
 from vllm_tt_plugin.model_runner import TTModelRunner
 
 VOCAB = 8
@@ -126,6 +127,7 @@ def test_extract_output_device_prefill_returns_front_packed_tokens():
             enable_log_probs=torch.zeros(2, dtype=torch.bool)
         ),
         max_num_logprobs=[None],
+        intermediate_prefill_mask=None,
     )
 
     sampled, logprobs = batch.extract_output(
@@ -144,7 +146,9 @@ def test_extract_output_device_prefill_returns_front_packed_tokens():
 def test_extract_output_host_decode_samples_full_slot_then_picks_rows():
     captured: dict = {}
     batch = _lane_batch()
-    batch.build_merged_sampling_metadata = lambda rows: None  # sampler ignores it
+    batch.build_merged_sampling_metadata = (
+        lambda rows, non_sampling_rows=None: None
+    )  # sampler ignores it
     runner = SimpleNamespace(host_sampler=_capturing_host_sampler(captured))
     # Full slot logits: row r's argmax is token r (vocab>=5).
     logits = torch.full((5, VOCAB), -10.0)
@@ -164,13 +168,17 @@ def test_extract_output_host_decode_samples_full_slot_then_picks_rows():
 def test_extract_output_host_prefill_scatters_logits_to_stable_rows():
     captured: dict = {}
     batch = _lane_batch()
-    batch.build_merged_sampling_metadata = lambda rows: None
+    batch.build_merged_sampling_metadata = lambda rows, non_sampling_rows=None: None
     runner = SimpleNamespace(host_sampler=_capturing_host_sampler(captured))
     # Prefill logits: one row per scheduled request (front-packed, plan order).
     prefill_logits = torch.full((2, VOCAB), -10.0)
     prefill_logits[0, 3] = 5.0  # scheduled request 0 -> token 3
     prefill_logits[1, 6] = 5.0  # scheduled request 1 -> token 6
-    model_input = SimpleNamespace(perform_device_sampling=False, grammar_bitmask=[None])
+    model_input = SimpleNamespace(
+        perform_device_sampling=False,
+        grammar_bitmask=[None],
+        intermediate_prefill_mask=None,
+    )
 
     sampled, _ = batch.extract_output(
         runner,
@@ -188,6 +196,127 @@ def test_extract_output_host_prefill_scatters_logits_to_stable_rows():
     for gap in (0, 2, 3):
         assert torch.all(full[gap] == 0)  # unscheduled rows left empty
     assert sampled.tolist() == [[3], [6]]
+
+
+# --------------------------------------------------------------------------
+# Chunked prefill: intermediate chunks emit no token
+# --------------------------------------------------------------------------
+
+
+def test_extract_output_skips_all_intermediate_prefill_rows():
+    batch = _lane_batch()
+    runner = SimpleNamespace(
+        host_sampler=lambda *args, **kwargs: pytest.fail("sampler must not run")
+    )
+    model_input = SimpleNamespace(
+        perform_device_sampling=False,
+        grammar_bitmask=[None],
+        intermediate_prefill_mask=torch.tensor([True]),
+    )
+
+    sampled, logprobs = batch.extract_output(
+        runner,
+        torch.zeros((1, VOCAB)),
+        None,
+        model_input,
+        scheduled_rows=[0],
+        is_decode=False,
+    )
+
+    assert sampled.tolist() == [[0]]
+    assert logprobs is None
+
+
+def test_build_host_generators_preserves_intermediate_request_rng():
+    intermediate = torch.Generator().manual_seed(11)
+    final = torch.Generator().manual_seed(22)
+    intermediate_before = intermediate.get_state().clone()
+    final_before = final.get_state().clone()
+
+    class FakeInputBatch:
+        sampling = SimpleNamespace(generators={0: intermediate, 1: final})
+
+        def advance_generators(self, rows):
+            for row in rows:
+                torch.rand(1, generator=self.sampling.generators[row])
+
+    generators = TTModelRunner._build_host_generators(
+        FakeInputBatch(), [0, 1], torch.tensor([True, False])
+    )
+
+    assert generators[0] is not intermediate
+    assert torch.equal(generators[0].get_state(), intermediate_before)
+    assert generators[1] is final
+    assert torch.equal(intermediate.get_state(), intermediate_before)
+    assert not torch.equal(final.get_state(), final_before)
+
+
+def test_get_output_tokens_skips_all_intermediate_prefill_rows():
+    runner = SimpleNamespace(
+        host_sampler=lambda *args, **kwargs: pytest.fail("sampler must not run")
+    )
+    model_input = SimpleNamespace(intermediate_prefill_mask=torch.tensor([True]))
+
+    sampled, logprobs = TTModelRunner._get_output_tokens(
+        runner,
+        torch.zeros((1, 1, VOCAB)),
+        None,
+        SimpleNamespace(),
+        model_input,
+        [1],
+        False,
+        False,
+    )
+
+    assert sampled[0].tolist() == [[0]]
+    assert logprobs == [None]
+
+
+def test_finish_lane_sync_suppresses_intermediate_prefill_output():
+    # The chunk ends at position 3 but the request has 8 tokens, so the step
+    # contributes KV state only.
+    model_input = SimpleNamespace(prompt_lens=[3])
+
+    def extract_output(
+        runner, tt_out, tt_log_probs, model_input, scheduled_rows, *, is_decode
+    ):
+        assert is_decode is False
+        return torch.tensor([[42]], dtype=torch.int32), None
+
+    def unexpected_final_output(*args, **kwargs):
+        raise AssertionError("intermediate prefill must not emit a sampled token")
+
+    runner = SimpleNamespace(
+        _apply_grammar_to_input=lambda model_input,
+        grammar_output,
+        *,
+        lane_total: model_input,
+        lane_batch=SimpleNamespace(
+            extract_output=extract_output,
+            req_ids={0: "request"},
+            num_tokens=[8],
+        ),
+        apply_and_build_runner_output=unexpected_final_output,
+    )
+
+    def build_chunked_prefill_output(**kwargs):
+        return TTModelRunner._build_chunked_prefill_output(runner, **kwargs)
+
+    runner._build_chunked_prefill_output = build_chunked_prefill_output
+
+    output = TTModelRunner._finish_lane_sync(
+        runner,
+        None,
+        tt_out=object(),
+        tt_log_probs=None,
+        model_input=model_input,
+        scheduled_rows=[0],
+        is_decode=False,
+        lane_total=1,
+    )
+
+    assert output.req_ids == ["request"]
+    assert output.sampled_token_ids == [[]]
 
 
 # --------------------------------------------------------------------------
@@ -225,6 +354,61 @@ def test_submit_prefill_forwards_plan_empty_slots_to_model():
     TTModelRunner.submit_prefill(runner, model_input, [2, 2])
 
     assert captured["empty_slots"] == [4]
+
+
+def _sampling_params(rows=2):
+    """Every field a per-row tensor, as ``submit_decode``'s ``.tolist()`` expects."""
+    return TTSamplingParams(
+        temperature=torch.ones(rows),
+        top_k=torch.zeros(rows, dtype=torch.int32),
+        top_p=torch.ones(rows),
+        presence_penalty=torch.zeros(rows),
+        frequency_penalty=torch.zeros(rows),
+        repetition_penalty=torch.ones(rows),
+        seed=torch.zeros(rows, dtype=torch.int64),
+        num_logprobs=torch.full((rows,), -1, dtype=torch.int32),
+        enable_log_probs=torch.zeros(rows, dtype=torch.bool),
+    )
+
+
+@pytest.mark.parametrize("perform_device_sampling", [True, False])
+def test_submit_decode_forwards_slot_remap_to_model(perform_device_sampling):
+    """``slot_remap`` moves per-slot state (GDN recurrent/conv), so it is not a
+    sampling parameter: one client's ``logprobs=5`` flips the whole step to host
+    sampling, and the gather still has to run for every co-batched request."""
+    captured: dict = {}
+
+    class FakeModel:
+        def decode_forward(self, **kwargs):
+            captured.update(kwargs)
+            return torch.zeros((1, 1), dtype=torch.float32)
+
+    runner = SimpleNamespace(
+        kv_caches=object(),
+        trace_mode="none",
+        request_specific_rope=False,
+        model=FakeModel(),
+    )
+    remap = torch.tensor([1, 0], dtype=torch.int32)
+    model_input = SimpleNamespace(
+        input_tokens=torch.zeros((2, 1), dtype=torch.int32),
+        block_tables=torch.zeros((2, 1), dtype=torch.int32),
+        input_positions=torch.zeros((2,), dtype=torch.int32),
+        block_tables_per_layer=None,
+        unpadded_batch_size=2,
+        tt_sampling_params=_sampling_params(),
+        perform_device_sampling=perform_device_sampling,
+        prompt_tokens=None,
+        output_tokens=None,
+        reset_batch=False,
+        slot_remap=remap,
+    )
+
+    controller = TTAsyncDecodeController(runner)
+    controller.submit_decode(model_input, read_from_device=True)
+
+    assert torch.equal(captured["slot_remap"], remap)
+    assert ("sampling_params" in captured) is perform_device_sampling
 
 
 def test_async_lane_decode_uses_batch_extraction():

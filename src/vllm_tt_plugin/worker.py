@@ -6,9 +6,8 @@ import os
 import time
 import warnings
 from contextlib import suppress
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any
 
-import torch
 import ttnn
 from vllm.config import VllmConfig
 from vllm.model_executor.model_loader import get_model_architecture
@@ -26,42 +25,30 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
-from vllm.v1.worker.worker_base import WorkerBase
-
-from vllm_tt_plugin.logger import init_tt_logger
-
-try:
-    # Newer vLLM has compile_or_warm_up_model return per-worker timings, which
-    # the executor reduces into compilation_config. Older vLLM lacks the type;
-    # fall back to a local definition so the return value is still well-formed.
-    from vllm.v1.worker.worker_base import CompilationTimes
-except ImportError:  # pragma: no cover - older vLLM without the timing contract
-    from typing import NamedTuple
-
-    class CompilationTimes(NamedTuple):
-        language_model: float
-        encoder: float
-
+from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 from vllm_tt_plugin.config import (
     get_tt_config,
     get_tt_data_parallel_size,
     get_tt_per_lane_max_num_seqs,
 )
-from vllm_tt_plugin.model_input import TTModelInput
+from vllm_tt_plugin.logger import init_tt_logger
 from vllm_tt_plugin.model_runner import TTModelRunner
 from vllm_tt_plugin.platform import (
+    _STANDARD_DP_VISIBLE_GROUPS_KEY,
     TTPlatform,
     _load_standard_dp_visible_groups,
     _should_pre_register_tt_test_models_from_cli,
     register_tt_models,
 )
 from vllm_tt_plugin.pooling_runner import TTPoolingModelRunner
-from vllm_tt_plugin.utils.dp_discovery import _parse_mesh_grid
+from vllm_tt_plugin.utils.dp_discovery import (
+    format_tt_visible_devices,
+    parse_mesh_grid,
+)
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
-    from vllm.v1.outputs import LogprobsLists
 
 logger = init_tt_logger(__name__)
 
@@ -72,39 +59,65 @@ logger = init_tt_logger(__name__)
 register_tt_models(register_test_models=_should_pre_register_tt_test_models_from_cli())
 
 
-def _ensure_visible_devices_env(
-    vllm_config: VllmConfig,
-    parallel_config,
-) -> None:
-    """Set ``TT_VISIBLE_DEVICES`` from the stored per-rank device groups
-    when the env var did not propagate through the engine-core fork chain.
+def _bind_visible_devices_env(vllm_config: VllmConfig) -> None:
+    """Bind ``TT_VISIBLE_DEVICES`` to this rank's device group.
 
-    Upstream sets the env var in the API-server process via
-    ``set_device_control_env_var`` before forking each engine-core.  On some
-    multi-device topologies (Galaxy) the env var may be lost by the time the
-    worker subprocess inside the engine-core's multiproc executor starts.
+    The engine-core launcher writes ``parallel_config.assigned_physical_gpu_ids``
+    rather than exporting a per-rank env var. tt-metal reads only the env var, so
+    the worker materializes it here; otherwise every rank keeps the launcher's
+    value and they share chips.
 
-    The per-rank visible-device list was persisted on ``additional_config``
-    by the parent's ``check_and_update_config`` and survives pickling, so we
-    can recover it here using ``data_parallel_index``.
+    Standard-DP discovery owns the rank-to-submesh topology. A nonempty
+    assignment must agree with the discovered group for the local rank. MPI
+    launches populate neither and keep the inherited value.
+
+    Raises:
+        RuntimeError: discovery holds no group for this rank or an assignment
+            conflicts with its discovered group.
     """
-    evar = TTPlatform.device_control_env_var
-    if os.environ.get(evar):
-        return  # already set — nothing to do
-
-    dp_index = getattr(parallel_config, "data_parallel_index", 0)
+    parallel_config = vllm_config.parallel_config
+    # Absent on the fork vLLM that the explicit MPI launcher targets.
+    assigned_physical_gpu_ids = getattr(
+        parallel_config, "assigned_physical_gpu_ids", None
+    )
     groups = _load_standard_dp_visible_groups(vllm_config)
-    if groups is None or dp_index >= len(groups):
-        return  # no stored groups or index out of range
 
-    visible_devices = groups[dp_index]
+    if groups is not None:
+        local_dp_rank = parallel_config.data_parallel_rank_local
+        if local_dp_rank is None or not 0 <= local_dp_rank < len(groups):
+            raise RuntimeError(
+                f"No TT device group for local DP rank {local_dp_rank}: "
+                f"discovery stored {len(groups)} group(s) under "
+                f"additional_config[{_STANDARD_DP_VISIBLE_GROUPS_KEY!r}]"
+            )
+
+        visible_devices = groups[local_dp_rank]
+        if assigned_physical_gpu_ids:
+            assigned_visible_devices = format_tt_visible_devices(
+                assigned_physical_gpu_ids
+            )
+            if assigned_visible_devices != visible_devices:
+                raise RuntimeError(
+                    "TT standard-DP assignment conflicts with discovery: "
+                    f"local DP rank {local_dp_rank} was assigned "
+                    f"{assigned_visible_devices!r}, but discovery requires "
+                    f"{visible_devices!r}."
+                )
+    elif assigned_physical_gpu_ids:
+        visible_devices = format_tt_visible_devices(assigned_physical_gpu_ids)
+    else:
+        return
+
+    evar = TTPlatform.device_control_env_var
+    inherited = os.environ.get(evar)
     os.environ[evar] = visible_devices
 
     logger.info(
-        "Recovered %s=%s from config for data_parallel_index=%s",
+        "Bound %s=%s for local DP rank %s (inherited %r)",
         evar,
         visible_devices,
-        dp_index,
+        parallel_config.data_parallel_rank_local,
+        inherited,
     )
 
 
@@ -113,7 +126,7 @@ def _resolve_mesh_grid(
     num_devices_available: int,
     visible_devices_env: str | None,
 ) -> tuple[int, int]:
-    mesh_grid = _parse_mesh_grid(
+    mesh_grid = parse_mesh_grid(
         mesh_device_env,
         num_devices_available,
         tg_mesh_grid=(8, 4),
@@ -201,21 +214,21 @@ class TTWorker(WorkerBase):
             self.enable_model_warmup = tt_config[enable_model_warmup_key]
 
     def init_device(self) -> None:
+        # tt-metal latches the visible set at first cluster construction and never
+        # re-reads the env var, so bind before `check_and_update_config` ->
+        # `get_model_architecture` imports the tt-metal model module.
+        _bind_visible_devices_env(self.vllm_config)
+
         # Validate/apply TT config in this worker process (multiprocessing
         # means platform class attrs + config mutations must be applied per
         # subprocess) before runner init.
         TTPlatform.check_and_update_config(self.vllm_config)
 
-        # Recover TT_VISIBLE_DEVICES from the config if the env var did not
-        # propagate through the engine-core → multiproc-executor fork chain
-        # (e.g. on Galaxy where the env var may be cleared between forks).
-        _ensure_visible_devices_env(self.vllm_config, self.parallel_config)
-
         local_dp_rank = self.parallel_config.data_parallel_rank_local
         logger.info(
             "TT worker standard-DP binding: data_parallel_index=%s "
             "data_parallel_rank_local=%s %s=%s MESH_DEVICE=%s",
-            getattr(self.parallel_config, "data_parallel_index", None),
+            self.parallel_config.data_parallel_index,
             local_dp_rank,
             TTPlatform.device_control_env_var,
             os.environ.get(TTPlatform.device_control_env_var),
@@ -410,11 +423,6 @@ class TTWorker(WorkerBase):
             return
         self.model_runner.initialize_kv_cache(kv_cache_config)
 
-    def initialize_cache(self, num_gpu_blocks: int, num_cpu_blocks: int) -> None:
-        # Cache is already initialized in initialize_from_config.
-        self.cache_config.num_gpu_blocks = num_gpu_blocks
-        self.cache_config.num_cpu_blocks = num_cpu_blocks
-
     def update_max_model_len(self, max_model_len: int) -> None:
         # The engine calls this via collective_rpc when --max-model-len -1
         # auto-fit reduces max_model_len to the KV cache capacity.
@@ -427,11 +435,10 @@ class TTWorker(WorkerBase):
         self.model_config.max_model_len = max_model_len
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
-        # Newer vLLM reduces per-worker timings returned here into
-        # compilation_config.compilation_time; older vLLM ignores the return.
-        # TT does device warmup rather than graph compilation, so report the
-        # warmup wall time as the language-model figure and zero for the
-        # (absent) encoder phase.
+        # The executor reduces per-worker timings returned here into
+        # compilation_config.compilation_time. TT does device warmup rather than
+        # graph compilation, so report the warmup wall time as the language-model
+        # figure and zero for the (absent) encoder phase.
         if not self.enable_model_warmup:
             logger.warning("Skipping model warmup")
             return CompilationTimes(language_model=0.0, encoder=0.0)
@@ -484,135 +491,6 @@ class TTWorker(WorkerBase):
         # Worker will always be healthy as long as it's running.
         return
 
-    # ---- DP gather hooks called by DPEngineCoreProc in core.py ----
-
-    def build_dp_model_input(
-        self,
-        scheduler_output: Optional["SchedulerOutput"],
-        grammar_output: Optional["GrammarOutput"],
-    ) -> tuple[
-        TTModelInput | None,
-        int,
-        int,
-        int,
-        int,
-        int,
-        int,
-        list[str],
-        dict[str, int],
-    ]:
-        """Build the local DP payload consumed by gathered-DP orchestration.
-
-        Returns `(local_input, max_blocks, has_structured_input,
-        has_penalties, reset_batch, can_sample_device, needs_logprobs,
-        req_ids, req_id_to_index)`, where `local_input` is this rank's
-        TT model input (or `None`) and the remaining fields are the
-        per-rank metadata consumed by gathered-DP orchestration.
-        """
-        return self.model_runner.prepare_dp_model_input(
-            scheduler_output, grammar_output
-        )
-
-    def can_attempt_steady_dp_decode_from_scheduler(
-        self,
-        scheduler_output: Optional["SchedulerOutput"],
-        grammar_output: Optional["GrammarOutput"],
-    ) -> bool:
-        """Return whether this rank can submit decode one step ahead.
-
-        This checks only local runner invariants. The engine combines all ranks'
-        answers into a single global decision before using the DP steady path.
-        """
-        return self.model_runner.can_attempt_steady_dp_decode_from_scheduler(
-            scheduler_output, grammar_output
-        )
-
-    def can_attempt_steady_decode_from_scheduler(
-        self,
-        scheduler_output: "SchedulerOutput",
-        grammar_output: Optional["GrammarOutput"],
-    ) -> bool:
-        """Return whether a scheduled non-DP step can overlap steady decode."""
-        return self.model_runner.can_attempt_steady_decode_from_scheduler(
-            scheduler_output, grammar_output
-        )
-
-    def build_dp_decode_gather_input(
-        self,
-        model_input: TTModelInput | None,
-        max_blocks_decode_batch: int,
-        any_structured_inputs: bool,
-        any_penalties_inputs: bool,
-    ) -> dict[str, Any]:
-        """Prepare the fixed-shape decode gather payload for DP orchestration.
-
-        Returns the fixed-shape decode gather payload used by gathered-DP
-        orchestration.
-        """
-        return self.model_runner.build_dp_decode_gather_input(
-            model_input,
-            max_blocks_decode_batch,
-            any_structured_inputs,
-            any_penalties_inputs,
-        )
-
-    def concat_and_execute_dp(
-        self,
-        inputs: list[TTModelInput | None] | dict[str, Any],
-        is_decode: bool,
-        max_blocks_decode_batch: int | None,
-        any_structured_inputs: bool,
-        non_block: bool = False,
-    ) -> Any:
-        """Execute one merged DP batch through the worker facade.
-
-        Returns either the packed DP execution result or an async DP decode
-        wrapper for the merged batch. The worker also enforces the "device rank
-        0 only" rule for merged TT execution.
-        """
-        assert self.is_driver_worker, "concat_and_execute_dp must run on driver"
-
-        local_dp_rank = self.parallel_config.data_parallel_rank_local
-        if local_dp_rank != 0:
-            return self._empty_dp_execute_result()
-
-        return self.model_runner.submit_dp_execution(
-            inputs,
-            is_decode,
-            max_blocks_decode_batch,
-            any_structured_inputs,
-            non_block=non_block,
-        )
-
-    def _empty_dp_execute_result(self) -> tuple[torch.Tensor, list]:
-        """Return the neutral DP payload for non-device local ranks.
-
-        Produces the correctly shaped no-op DP payload for colocated ranks that
-        do not execute the merged TT batch.
-        """
-        world = self.parallel_config.data_parallel_size
-        batch_size = self.model_runner.tt_per_lane_max_num_seqs
-        return torch.zeros((world, batch_size, 1), dtype=torch.int32), [None] * world
-
-    def apply_dp_execution_result(
-        self,
-        sampled_token_ids: torch.Tensor,
-        logprobs_lists: Optional["LogprobsLists"] = None,
-        req_ids: list[str] | None = None,
-        req_id_to_index: dict[str, int] | None = None,
-    ) -> ModelRunnerOutput:
-        """Apply the local DP rank result through the worker facade.
-
-        Applies the local DP rank result and returns the corresponding
-        `ModelRunnerOutput`.
-        """
-        return self.model_runner.apply_dp_execution_result(
-            sampled_token_ids,
-            logprobs_lists,
-            req_ids=req_ids,
-            req_id_to_index=req_id_to_index,
-        )
-
     # ---- Destructor (used to close devices) ----
 
     def __del__(self):
@@ -648,10 +526,10 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig, num_devices: int = 1) -
         # Pass the per-submesh batch (the requests one submesh actually serves),
         # not the global engine capacity, so a model that derives a per-user
         # token budget from ``max_num_seqs`` computes the same value whether
-        # parallelism is expressed as gathered DP (each rank its own engine) or
-        # single-process lane mode. This matches the padding term below, which
-        # also uses ``get_tt_per_lane_max_num_seqs``, and keeps the KV shape
-        # identical across both modes.
+        # parallelism is expressed as multi-process DP (each rank its own
+        # engine) or single-process lane mode. This matches the padding term
+        # below, which also uses ``get_tt_per_lane_max_num_seqs``, and keeps the
+        # KV shape identical across both modes.
         max_tokens_all_users = model_class.get_max_tokens_all_users(
             model_name=model_config.model,
             num_devices=num_devices,
@@ -684,8 +562,8 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig, num_devices: int = 1) -
     # ``num_blocks`` is applied to each submesh KV cache un-divided, so the
     # padding must use the *per-lane/per-rank* batch -- the number of requests
     # a single submesh actually serves -- not the global engine capacity. In
-    # gathered DP this is ``max_num_seqs`` (each rank is its own engine); in
-    # single-process lane mode it is ``max_num_seqs // lane count``.
+    # multi-process DP this is ``max_num_seqs`` (each rank is its own engine);
+    # in single-process lane mode it is ``max_num_seqs // lane count``.
     # Both reduce to the same per-submesh value, keeping the KV shape identical
     # regardless of how parallelism is expressed.
     max_batch = get_tt_per_lane_max_num_seqs(vllm_config)
@@ -753,26 +631,25 @@ def get_fabric_config(tt_config, num_devices):
         # Ignore any explicit fabric request for single-device meshes.
         return None
 
-    # Set the most common value as default
-    is_6u = ttnn.cluster.get_cluster_type() == ttnn.cluster.ClusterType.GALAXY
-    fabric_config = (
-        ttnn.FabricConfig.FABRIC_1D_RING if is_6u else ttnn.FabricConfig.FABRIC_1D
-    )
+    # Wormhole Galaxy (6U) uses a 1D ring. Blackhole Galaxy needs a 2D torus:
+    # column-axis collectives have no wraparound path on 1D fabrics.
+    cluster_type = ttnn.cluster.get_cluster_type()
+    if cluster_type == ttnn.cluster.ClusterType.BLACKHOLE_GALAXY:
+        fabric_config = ttnn.FabricConfig.FABRIC_2D_TORUS_XY
+    elif cluster_type == ttnn.cluster.ClusterType.GALAXY:
+        fabric_config = ttnn.FabricConfig.FABRIC_1D_RING
+    else:
+        fabric_config = ttnn.FabricConfig.FABRIC_1D
 
-    # Override fabric_config if specified in TT plugin config.
+    # Override fabric_config if specified in TT plugin config. Resolve the name
+    # from ttnn.FabricConfig so newly added fabrics (e.g. FABRIC_2D_TORUS_XY)
+    # work without a plugin allow-list update.
     if tt_config is not None and "fabric_config" in tt_config:
         fabric_config_str = tt_config["fabric_config"]
-        fabric_config_map = {
-            "DISABLED": ttnn.FabricConfig.DISABLED,
-            "FABRIC_1D": ttnn.FabricConfig.FABRIC_1D,
-            "FABRIC_1D_RING": ttnn.FabricConfig.FABRIC_1D_RING,
-            "FABRIC_2D": ttnn.FabricConfig.FABRIC_2D,
-            "CUSTOM": ttnn.FabricConfig.CUSTOM,
-        }
-        fabric_config = fabric_config_map.get(fabric_config_str)
+        fabric_config = ttnn.FabricConfig.__members__.get(fabric_config_str)
         assert fabric_config is not None, (
             f"Invalid fabric_config: {fabric_config_str}. "
-            f"Expected one of {list(fabric_config_map.keys())}."
+            f"Expected one of {list(ttnn.FabricConfig.__members__)}."
         )
     return fabric_config
 

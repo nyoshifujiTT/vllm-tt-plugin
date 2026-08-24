@@ -20,10 +20,13 @@ from vllm_tt_plugin.config import (
 from vllm_tt_plugin.logger import init_tt_logger
 from vllm_tt_plugin.utils.dp_discovery import (
     StandardDPAssignmentT,
-    _run_standard_dp_visible_device_group_discovery,
-    _split_standard_dp_discovery_result,
+    run_standard_dp_visible_device_group_discovery,
+    split_standard_dp_discovery_result,
 )
 
+# These stay behind TYPE_CHECKING deliberately. ``vllm.config`` imports
+# ``HAS_TRITON``, whose module resolves ``current_platform`` at import time, which
+# loads this plugin: a module-level ``vllm.config`` import here is a cycle.
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.inputs import EngineInput
@@ -43,14 +46,63 @@ _STANDARD_DP_VISIBLE_GROUPS_KEY = "_tt_standard_dp_visible_groups"
 TT_SCHEDULER_CLS = "vllm_tt_plugin.scheduler.TTScheduler"
 TT_LANE_SCHEDULER_CLS = "vllm_tt_plugin.lane_scheduler.TTLaneCoordinator"
 
+# vLLM reads this on every access until ``enable_envs_cache()``, so writing it
+# from the platform hooks still reaches the engine core and every worker.
+_V2_MODEL_RUNNER_ENV = "VLLM_USE_V2_MODEL_RUNNER"
+
 # TT model versions backed by the single-execute Galaxy generator
-# (models.demos.llama3_70b_galaxy.tt.generator:Generator). For these, gathered
-# multi-process DP is deprecated in favor of single-process TT lanes. Maps the
-# selecting env var to the version value that routes through that generator.
+# (models.demos.llama3_70b_galaxy.tt.generator:Generator). For these,
+# --data_parallel_size folds into single-process TT lanes. Maps the selecting
+# env var to the version value that routes through that generator.
 _GALAXY_GENERATOR_VERSIONS = {
     "TT_LLAMA_TEXT_VER": "llama3_70b_galaxy",
     "TT_QWEN3_TEXT_VER": "qwen3_32b_galaxy",
 }
+
+# HF ``model_type`` values whose tt-metal generator accepts a ``chunk_start_idx``
+# prefill, i.e. the ones token-chunked prefill has been validated against.
+_CHUNKED_PREFILL_MODEL_TYPES = {"gemma4", "gemma4_unified"}
+
+
+def _apply_chunked_prefill_policy(vllm_config: "VllmConfig") -> None:
+    """Restrict token-chunked prefill to the model types that support it."""
+    scheduler_config = vllm_config.scheduler_config
+    model_config = vllm_config.model_config
+    model_type = getattr(model_config.hf_config, "model_type", None)
+
+    if model_type in _CHUNKED_PREFILL_MODEL_TYPES:
+        # A chunk boundary inside a multimodal item would split its embeddings
+        # from their positions. Only meaningful while prefill can be split, and
+        # vLLM rejects the flag outright when one item exceeds the token budget,
+        # so it stays off for every model type below.
+        scheduler_config.disable_chunked_mm_input = True
+        return
+
+    if scheduler_config.enable_chunked_prefill:
+        logger.info(
+            "Chunked prefill is not supported for `model_type=%s`; disabling it.",
+            model_type,
+        )
+        scheduler_config.enable_chunked_prefill = False
+
+        # vLLM does this bump silently earlier if chunked prefill is already
+        # disabled and max_num_batched_tokens is not explicitly set. We can't
+        # know if it was specified or the default, hence the warning.
+        max_num_batched_tokens = scheduler_config.max_num_batched_tokens
+        max_model_len = model_config.max_model_len
+        if max_num_batched_tokens < max_model_len:
+            logger.warning(
+                "max_num_batched_tokens=%d < max_model_len=%d with chunked "
+                "prefill disabled, bumping max_num_batched_tokens to match.",
+                max_num_batched_tokens,
+                max_model_len,
+            )
+            scheduler_config.max_num_batched_tokens = max_model_len
+
+    # The base scheduler caps a prefill at this threshold before it consults
+    # ``enable_chunked_prefill``, so leaving it nonzero still splits prefills
+    # for a model that cannot resume one.
+    scheduler_config.long_prefill_token_threshold = 0
 
 
 def _galaxy_generator_version() -> str | None:
@@ -98,9 +150,8 @@ def _store_standard_dp_visible_groups(
 ) -> None:
     """Store the per-rank visible-device group list on the vLLM config.
 
-    Indexed by DP rank so worker subprocesses can recover
-    ``TT_VISIBLE_DEVICES`` from ``data_parallel_index`` when the
-    env-var does not propagate through the engine-core fork chain.
+    Indexed by DP rank, and kept on ``additional_config`` because that is a
+    declared config field and so survives pickling into the worker subprocess.
     """
     additional_config = getattr(vllm_config, "additional_config", None)
     if not isinstance(additional_config, dict):
@@ -112,14 +163,17 @@ def _store_standard_dp_visible_groups(
 def _load_standard_dp_visible_groups(
     vllm_config: "VllmConfig",
 ) -> list[str] | None:
-    """Load the per-rank visible-device group list from the vLLM config."""
-    additional_config = getattr(vllm_config, "additional_config", None) or {}
+    """Load the per-rank visible-device group list from the vLLM config.
 
+    ``None`` means nothing was stored. An empty list means discovery stored
+    nothing usable, which callers must not treat as "keep the inherited value".
+    """
+    additional_config = getattr(vllm_config, "additional_config", None)
     if not isinstance(additional_config, dict):
         return None
 
     groups = additional_config.get(_STANDARD_DP_VISIBLE_GROUPS_KEY)
-    if not isinstance(groups, list) or not groups:
+    if not isinstance(groups, list):
         return None
 
     return [str(g) for g in groups]
@@ -129,7 +183,7 @@ def _load_standard_dp_mesh_grids(
     vllm_config: "VllmConfig",
 ) -> dict[str, tuple[int, int]]:
     """Load stored mesh-grid hints from the vLLM config."""
-    additional_config = getattr(vllm_config, "additional_config", None) or {}
+    additional_config = getattr(vllm_config, "additional_config", None)
     if not isinstance(additional_config, dict):
         return {}
 
@@ -195,7 +249,7 @@ def _resolve_standard_dp_visible_device_groups(
     mp_ctx = multiprocessing.get_context("spawn")
     parent_conn, child_conn = mp_ctx.Pipe(duplex=False)
     proc = mp_ctx.Process(
-        target=_run_standard_dp_visible_device_group_discovery,
+        target=run_standard_dp_visible_device_group_discovery,
         args=(
             child_conn,
             os.environ.get("MESH_DEVICE"),
@@ -248,17 +302,17 @@ def _resolve_standard_dp_visible_device_groups(
 
 # GPT-OSS is served by the tt_transformers generator, which drives data
 # parallelism inside a single process -- either user-row sharding on multi-row
-# meshes or one Generator over per-DP submeshes. Gathered multi-process DP is
-# therefore unnecessary: --data_parallel_size folds into in-process TT lanes,
-# the same as the Galaxy generators.
+# meshes or one Generator over per-DP submeshes. Multi-process DP is therefore
+# unnecessary: --data_parallel_size folds into in-process TT lanes, the same as
+# the Galaxy generators.
 _GPT_OSS_ARCH = "GptOssForCausalLM"
 
 
-def _model_folds_gather_dp_into_lanes(model_class) -> bool:
-    """Whether the model's gathered multi-process DP folds into in-process lanes.
+def _model_folds_dp_into_lanes(model_class) -> bool:
+    """Whether the model's ``--data_parallel_size`` folds into in-process lanes.
 
     True for the Galaxy generators and for GPT-OSS, both of which drive data
-    parallelism within a single process. Other models keep gathered
+    parallelism within a single process. Other models keep standard
     multi-process DP.
     """
     if _galaxy_generator_version() is not None:
@@ -271,9 +325,9 @@ def _collapse_parallel_config_to_single_process(parallel_config) -> None:
 
     ``ParallelConfig.__post_init__`` has already derived multi-process DP state
     (rank, local size, master port, LB mode) from ``data_parallel_size`` by the
-    time the platform hook runs. When we fold gathered DP into single-process TT
-    lanes we must undo that so vLLM does not stand up multi-process DP
-    coordination. ``world_size`` stays 1 because the TT backend requires
+    time the platform hook runs. When we fold DP into single-process TT lanes we
+    must undo that so vLLM does not stand up multi-process DP coordination.
+    ``world_size`` stays 1 because the TT backend requires
     ``tensor_parallel_size == pipeline_parallel_size == 1`` and DP does not
     multiply it (no external launcher), so ``world_size_across_dp`` collapses to
     1 automatically once ``data_parallel_size`` is reset.
@@ -303,32 +357,30 @@ def _collapse_parallel_config_to_single_process(parallel_config) -> None:
     parallel_config.distributed_executor_backend = "uni"
 
 
-def _convert_gather_dp_to_lanes(vllm_config: "VllmConfig", model_class=None) -> None:
-    """Transparently convert gathered multi-process DP into in-process TT lanes.
+def _convert_dp_to_lanes(vllm_config: "VllmConfig", model_class=None) -> None:
+    """Transparently convert multi-process DP into in-process TT lanes.
 
     Models that run as a single shared device execute on one mesh -- the Galaxy
     generators (``llama3_70b_galaxy``, ``qwen3_32b_galaxy``) and GPT-OSS under
-    user-row sharding -- do not need gathered multi-process DP. Rather than
-    asking users to migrate flags, we run ``--data_parallel_size N`` as ``N``
-    in-process lanes: record the resolved lane count and reset
-    ``data_parallel_size`` to 1.
+    user-row sharding -- do not need multi-process DP. Rather than asking users
+    to migrate flags, we run ``--data_parallel_size N`` as ``N`` in-process
+    lanes: record the resolved lane count and reset ``data_parallel_size`` to 1.
 
-    To preserve the historical capacity contract -- where each of the ``N``
-    gathered DP ranks handled ``max_num_seqs`` requests -- the global
-    ``max_num_seqs`` is scaled by the lane count. Lane mode then partitions that
-    global capacity evenly across lanes, so the per-lane capacity stays at the
-    value the user requested (e.g. ``--data_parallel_size 4 --max_num_seqs 8``
-    becomes 4 lanes, each with max 8 seqs, for a global max of 32).
+    ``max_num_seqs`` is per-DP-rank under multi-process DP but global under lane
+    mode, so it is scaled by the lane count on the way in. Lane mode then
+    partitions that global capacity evenly across lanes, keeping the per-lane
+    capacity at the value the user asked for (e.g. ``--data_parallel_size 4
+    --max_num_seqs 8`` becomes 4 lanes, each with max 8 seqs, global max 32).
 
-    No-op unless ``data_parallel_size > 1`` and the model folds gathered DP
-    into lanes (``_model_folds_gather_dp_into_lanes``). Idempotent: after
-    conversion ``data_parallel_size == 1``, so re-entry short-circuits.
+    No-op unless ``data_parallel_size > 1`` and the model folds DP into lanes
+    (``_model_folds_dp_into_lanes``). Idempotent: after conversion
+    ``data_parallel_size == 1``, so re-entry short-circuits.
     """
     parallel_config = vllm_config.parallel_config
     data_parallel_size = parallel_config.data_parallel_size
     if data_parallel_size <= 1:
         return
-    if not _model_folds_gather_dp_into_lanes(model_class):
+    if not _model_folds_dp_into_lanes(model_class):
         return
 
     lanes = data_parallel_size
@@ -341,7 +393,7 @@ def _convert_gather_dp_to_lanes(vllm_config: "VllmConfig", model_class=None) -> 
     _collapse_parallel_config_to_single_process(parallel_config)
 
     logger.info(
-        "Model requested gathered DP (--data_parallel_size=%d) but runs as a "
+        "Model requested DP (--data_parallel_size=%d) but runs as a "
         "single device execute; running single-process TT lane-DP instead "
         "(%d lanes, per-lane max_num_seqs=%d, global max_num_seqs=%d).",
         data_parallel_size,
@@ -394,38 +446,79 @@ def _should_pre_register_tt_test_models_from_cli() -> bool:
 def _install_tt_harmony_truncation_patch() -> None:
     """Use right truncation for TT GPT-OSS tokenizers.
 
-    GPT-OSS harmony prompts have important template/control tokens at the
-    beginning. Left truncation can remove those tokens when prompt truncation is
-    requested, so TT keeps the prefix and truncates from the right for these
-    models.
+    GPT-OSS harmony prompts carry template/control tokens at the beginning, which
+    upstream's ``truncation_side="left"`` default for generate models drops when
+    prompt truncation is requested. TT keeps the prefix and truncates from the
+    right instead.
+
+    ``cached_tokenizer_from_config`` is the hook because it is the call that
+    builds the engine's tokenizer. ``tokenizer_args_from_config`` looks like the
+    natural target but is not: its only caller keeps the renderer mode and
+    discards the tokenizer kwargs. Injecting into the incoming kwargs also keeps
+    the downstream ``lru_cache`` keyed on ``truncation_side`` rather than
+    mutating a cached result.
+
+    ``vllm.renderers.registry`` binds the name at import time, so patch the
+    module too when it is already loaded; if it loads later it picks up the
+    replacement from ``vllm.tokenizers.registry``.
 
     TODO: remove this once fixed in vLLM core.
     """
     import vllm.tokenizers.registry as tokenizer_registry
 
-    if hasattr(tokenizer_registry, "_tt_original_tokenizer_args_from_config"):
+    if hasattr(tokenizer_registry, "_tt_original_cached_tokenizer_from_config"):
         return
 
-    original = tokenizer_registry.tokenizer_args_from_config
-    tokenizer_registry._tt_original_tokenizer_args_from_config = original
+    original = tokenizer_registry.cached_tokenizer_from_config
+    tokenizer_registry._tt_original_cached_tokenizer_from_config = original
 
-    def tokenizer_args_from_config_tt(config, **kwargs):
-        tokenizer_mode, tokenizer_name, args, tokenizer_kwargs = original(
-            config, **kwargs
-        )
+    def cached_tokenizer_from_config_tt(model_config, **kwargs):
+        tokenizer_name = str(getattr(model_config, "tokenizer", "") or "").lower()
         if (
-            "truncation_side" not in tokenizer_kwargs
-            and config.runner_type in ("generate", "draft")
-            and "gpt-oss" in str(tokenizer_name or "").lower()
+            "truncation_side" not in kwargs
+            and model_config.runner_type in ("generate", "draft")
+            and "gpt-oss" in tokenizer_name
         ):
-            tokenizer_kwargs["truncation_side"] = "right"
-        return tokenizer_mode, tokenizer_name, args, tokenizer_kwargs
+            kwargs["truncation_side"] = "right"
+        return original(model_config, **kwargs)
 
-    tokenizer_registry.tokenizer_args_from_config = tokenizer_args_from_config_tt
+    tokenizer_registry.cached_tokenizer_from_config = cached_tokenizer_from_config_tt
 
     renderer_registry = sys.modules.get("vllm.renderers.registry")
     if renderer_registry is not None:
-        renderer_registry.tokenizer_args_from_config = tokenizer_args_from_config_tt
+        renderer_registry.cached_tokenizer_from_config = cached_tokenizer_from_config_tt
+
+
+def _pin_v1_model_runner() -> None:
+    """Keep the engine on vLLM's V1 model runner.
+
+    ``VllmConfig.use_v2_model_runner`` defaults on for every dense architecture,
+    and the V2 scheduler drops two things the TT runner reads: it folds
+    preemption-resumed requests into ``scheduled_new_reqs`` (so
+    ``CachedRequestData.resumed_req_ids`` is always empty) and stops populating
+    ``all_token_ids``, moving the history to
+    ``NewRequestData.prefill_token_ids``. ``build_cached_request_state`` reads
+    neither, so a resume after preemption would rebuild the request with an empty
+    ``output_token_ids`` while ``num_computed_tokens`` still counts the generated
+    tokens: silent output corruption.
+
+    Upstream only spares TT today because ``HAS_TRITON`` is false on a TT host,
+    which flips when an NVIDIA driver is present or ``CUDA_VISIBLE_DEVICES`` is
+    set to the empty string. Pin the variable rather than rely on that.
+
+    Refuse an explicit opt-in instead of honoring it: the corruption is silent,
+    so a clear failure is strictly more useful than a wrong answer.
+    """
+    requested = os.environ.get(_V2_MODEL_RUNNER_ENV)
+    if requested is not None and requested != "0":
+        raise ValueError(
+            f"{_V2_MODEL_RUNNER_ENV}={requested!r} selects vLLM's V2 model "
+            "runner. The TT backend implements only the V1 model-runner "
+            "contract: under V2 a request resumed after preemption silently "
+            f"loses every generated token. Unset {_V2_MODEL_RUNNER_ENV} or set "
+            "it to 0."
+        )
+    os.environ[_V2_MODEL_RUNNER_ENV] = "0"
 
 
 def _iter_extra_model_bundles():
@@ -728,7 +821,17 @@ class TTPlatform(Platform):
     simple_compile_backend: str = "eager"
 
     @classmethod
-    def device_id_to_physical_device_id(cls, device_id: int):
+    def device_id_to_physical_device_id(cls, device_id: int) -> str | int:
+        """Map a DP rank to its whole comma-joined TT device group.
+
+        Deviates from upstream, where ``device_id`` is a logical device index and
+        the return is one physical id. Sound only because TT pins ``world_size``
+        to 1, so upstream asks for exactly one id per DP rank and keeps it as a
+        one-element list: ``assigned_physical_gpu_ids`` carries a group string,
+        not the ``list[int]`` it declares. Anything reading that list as
+        per-device, its length as a device count or its entries as ints, is
+        wrong for TT.
+        """
         groups = cls._standard_dp_visible_device_groups
         if groups is not None:
             return groups[device_id]
@@ -753,6 +856,7 @@ class TTPlatform(Platform):
         # this process, so we must ensure TT test models are registered early
         # when explicitly requested via CLI override.
         super().pre_register_and_update(parser)
+        _pin_v1_model_runner()
         _install_tt_harmony_truncation_patch()
         if _should_pre_register_tt_test_models_from_cli():
             register_tt_test_models()
@@ -784,30 +888,13 @@ class TTPlatform(Platform):
 
     @classmethod
     def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
+        # Before any read of ``vllm_config.use_v2_model_runner``, which
+        # ``VllmConfig.__post_init__`` performs immediately after this hook.
+        _pin_v1_model_runner()
         _install_tt_harmony_truncation_patch()
         cls._standard_dp_visible_device_groups = None
         cls._standard_dp_mesh_grids = {}
-        if vllm_config.scheduler_config.enable_chunked_prefill:
-            logger.info("Chunked prefill is not yet supported for TT backend")
-            vllm_config.scheduler_config.enable_chunked_prefill = False
-            # vLLM does this bump silently earlier
-            # if chunked prefill is already disabled,
-            # and max_num_batched_tokens is not explicitly set.
-            # We can't know if it was specified
-            # or the default, hence the warning.
-            if (
-                vllm_config.scheduler_config.max_num_batched_tokens
-                < vllm_config.model_config.max_model_len
-            ):
-                logger.warning(
-                    "max_num_batched_tokens=%d < max_model_len=%d with chunked prefill "
-                    "disabled, bumping max_num_batched_tokens to match.",
-                    vllm_config.scheduler_config.max_num_batched_tokens,
-                    vllm_config.model_config.max_model_len,
-                )
-                vllm_config.scheduler_config.max_num_batched_tokens = (
-                    vllm_config.model_config.max_model_len
-                )
+        _apply_chunked_prefill_policy(vllm_config)
 
         assert not vllm_config.speculative_config, (
             "Speculative decoding is not yet supported for TT backend"
@@ -861,11 +948,6 @@ class TTPlatform(Platform):
         parallel_config = vllm_config.parallel_config
         if parallel_config.worker_cls == "auto":
             parallel_config.worker_cls = "vllm_tt_plugin.worker.TTWorker"
-        parallel_config.engine_core_cls = "vllm.v1.engine.core.EngineCore"
-        parallel_config.engine_core_proc_cls = "vllm.v1.engine.core.EngineCoreProc"
-        parallel_config.engine_core_launcher_cls = (
-            "vllm.v1.engine.utils.CoreEngineLauncher"
-        )
 
         # For TT models, prepend "TT" to the architecture name,
         # e.g. "TTLlamaForCausalLM"
@@ -987,12 +1069,12 @@ class TTPlatform(Platform):
             vllm_config.scheduler_config.async_scheduling = False
 
         # Single-execute models (Galaxy generators, GPT-OSS under user-row
-        # sharding) run one shared device execute on the full mesh, so gathered
+        # sharding) run one shared device execute on the full mesh, so
         # multi-process DP is folded transparently into single-process TT lanes
         # -- users keep passing --data_parallel_size with no other flag changes.
         # Must run before the validation/routing below so the lane path is
         # selected. model_class carries the single-execute decision for GPT-OSS.
-        _convert_gather_dp_to_lanes(vllm_config, model_class)
+        _convert_dp_to_lanes(vllm_config, model_class)
 
         is_lane_mode = uses_tt_lane_coordinator(vllm_config)
         if (
@@ -1017,23 +1099,44 @@ class TTPlatform(Platform):
         else:
             vllm_config.scheduler_config.scheduler_cls = TT_SCHEDULER_CLS
 
-        parallel_config.dp_engine_core_proc_cls = "vllm.v1.engine.core.DPEngineCoreProc"
-
         if not is_lane_mode:
             cls._standard_dp_mesh_grids = _load_standard_dp_mesh_grids(vllm_config)
-            discovery_result = _resolve_standard_dp_visible_device_groups(vllm_config)
-            (
-                cls._standard_dp_visible_device_groups,
-                resolved_mesh_grids,
-            ) = _split_standard_dp_discovery_result(discovery_result)
-            if resolved_mesh_grids:
-                cls._standard_dp_mesh_grids = resolved_mesh_grids
-                _store_standard_dp_mesh_grids(vllm_config, resolved_mesh_grids)
-            if cls._standard_dp_visible_device_groups:
-                _store_standard_dp_visible_groups(
-                    vllm_config, cls._standard_dp_visible_device_groups
+            cls._standard_dp_visible_device_groups = _load_standard_dp_visible_groups(
+                vllm_config
+            )
+            # Discovery opens the parent mesh, so only a process that still sees
+            # the whole machine may run it. This hook also re-runs in the worker,
+            # after `TT_VISIBLE_DEVICES` is narrowed to one group; there it must
+            # consume what `VllmConfig` carries, or it would rediscover against
+            # the narrowed cluster and overwrite the real submesh shapes.
+            if cls._standard_dp_visible_device_groups is None:
+                discovery_result = _resolve_standard_dp_visible_device_groups(
+                    vllm_config
                 )
+                (
+                    cls._standard_dp_visible_device_groups,
+                    resolved_mesh_grids,
+                ) = split_standard_dp_discovery_result(discovery_result)
+                if resolved_mesh_grids:
+                    cls._standard_dp_mesh_grids = resolved_mesh_grids
+                    _store_standard_dp_mesh_grids(vllm_config, resolved_mesh_grids)
+                if cls._standard_dp_visible_device_groups is not None:
+                    _store_standard_dp_visible_groups(
+                        vllm_config, cls._standard_dp_visible_device_groups
+                    )
+
         if _uses_explicit_tt_mpi_launch(vllm_config):
+            # ``ParallelConfig`` permits arbitrary attribute writes, so setting a
+            # launcher hook a vLLM build does not define is silently ignored and
+            # the run quietly single-hosts itself. Fail instead.
+            if not hasattr(parallel_config, "engine_core_launcher_cls"):
+                raise NotImplementedError(
+                    "TT MPI multi-host launch (tt.rank_binding, tt.mpi_args, "
+                    "nnodes > 1) needs an engine-core launcher hook "
+                    "(ParallelConfig.engine_core_launcher_cls and "
+                    "vllm.v1.engine.utils.CoreEngineLauncher) that this vLLM "
+                    "build does not provide."
+                )
             parallel_config.engine_core_launcher_cls = (
                 "vllm_tt_plugin.launcher.TTCoreEngineLauncher"
             )
