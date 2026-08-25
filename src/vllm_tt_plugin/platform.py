@@ -615,7 +615,14 @@ def _builtin_models_enabled() -> bool:
     return val.strip().lower() not in ("0", "false", "no", "off")
 
 
-def register_tt_models(register_test_models=False) -> None:
+def register_tt_models(register_test_models=False, runner_type: str | None = None) -> None:
+    """Register the TT model architectures.
+
+    ``runner_type`` is vLLM's resolved runner for this run ("generate",
+    "pooling", ...). It matters because a few checkpoints share one architecture
+    string between a generative and an embedding model (Qwen3-Embedding declares
+    Qwen3ForCausalLM), and only the runner tells them apart.
+    """
     from vllm.model_executor.models.registry import ModelRegistry
 
     # Dynamic hook: register any bundles dropped under EXTRA_MODELS_DIR. Runs
@@ -674,6 +681,26 @@ def register_tt_models(register_test_models=False) -> None:
         )
 
     _register_model_if_missing(ModelRegistry, "TTQwen3ForCausalLM", path_qwen3_text)
+
+    # Qwen3 - Embedding.
+    #
+    # Qwen3-Embedding ships an HF config whose architectures is
+    # ["Qwen3ForCausalLM"] -- the same string the text model uses -- so the
+    # TT-prefixed arch alone cannot tell the two apart. vLLM does distinguish
+    # them: an embedding checkpoint resolves to runner_type "pooling", and the
+    # caller passes that through here. For a pooling run the TTQwen3ForCausalLM
+    # slot must resolve to the embedding wrapper; leaving the text generator
+    # registered makes vLLM wrap it via _create_pooling_model_cls, which then
+    # fails on the TT constructor ("ModelForPooling.__init__() takes 1
+    # positional argument but 4 were given").
+    if runner_type == "pooling":
+        path_qwen3_embed = (
+            "models.demos.qwen3_embedding.tt.generator_vllm:Qwen3EmbeddingForTTvLLM"
+        )
+        # Overwrite rather than _register_model_if_missing: the text path above
+        # already claimed this arch, and for a pooling run the embedding wrapper
+        # is the correct target.
+        ModelRegistry.register_model("TTQwen3ForCausalLM", path_qwen3_embed)
 
     # Qwen3.5 - Text
     qwen35_text_version = os.getenv("TT_QWEN35_TEXT_VER", "qwen36_blackhole")
@@ -943,7 +970,10 @@ class TTPlatform(Platform):
             assert register_test_models in [True, False], (
                 f"Invalid option register_test_models: {register_test_models}"
             )
-        register_tt_models(register_test_models)
+        register_tt_models(
+            register_test_models,
+            runner_type=vllm_config.model_config.runner_type,
+        )
 
         parallel_config = vllm_config.parallel_config
         if parallel_config.worker_cls == "auto":
