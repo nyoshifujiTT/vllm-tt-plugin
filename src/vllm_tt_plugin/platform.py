@@ -984,6 +984,15 @@ class TTPlatform(Platform):
             )
             if vllm_config.cache_config is not None:
                 vllm_config.cache_config.enable_prefix_caching = False
+            # A pooling model runs one forward per scheduled batch and cannot
+            # resume a partially prefilled sequence, so the scheduler must not
+            # split a request. The base scheduler caps a prefill at
+            # ``long_prefill_token_threshold`` before it ever consults
+            # ``enable_chunked_prefill``, and vLLM derives a nonzero default
+            # from max_num_batched_tokens, which silently splits a multi-document
+            # rerank across steps: measured on p150, an 8-document request at
+            # 8192 tokens each took two device passes instead of one.
+            _apply_chunked_prefill_policy(vllm_config)
             logger.info(
                 "Configured TT pooling model path (default scheduler, no KV cache)."
             )

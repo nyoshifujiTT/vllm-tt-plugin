@@ -94,3 +94,28 @@ def test_token_budget_is_left_alone_when_it_already_covers_the_model_len():
     _apply_chunked_prefill_policy(config)
 
     assert config.scheduler_config.max_num_batched_tokens == 32768
+
+
+def test_pooling_models_also_get_the_unsplit_prefill_policy():
+    """A pooling model runs one forward per scheduled batch and cannot resume a
+    partially prefilled sequence, so the scheduler must not split a request.
+
+    The pooling branch of check_and_update_config returns early, and it used to
+    return before applying this policy. vLLM derives a nonzero
+    long_prefill_token_threshold from max_num_batched_tokens, and the base
+    scheduler applies that cap before it ever looks at enable_chunked_prefill,
+    so a multi-document rerank was silently split across steps: measured on
+    p150, 8 documents of 8192 tokens took two device passes instead of one.
+    """
+    config = _vllm_config(
+        model_type="xlm-roberta",
+        enable_chunked_prefill=True,
+        max_num_batched_tokens=262144,
+        max_model_len=8192,
+        long_prefill_token_threshold=8192,
+    )
+
+    _apply_chunked_prefill_policy(config)
+
+    assert config.scheduler_config.long_prefill_token_threshold == 0
+    assert config.scheduler_config.enable_chunked_prefill is False
