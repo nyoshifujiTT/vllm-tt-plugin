@@ -4,7 +4,7 @@
 import inspect
 
 from torch import nn
-from vllm.config import ModelConfig, VllmConfig
+from vllm.config import ModelConfig, VllmConfig, set_current_vllm_config
 from vllm.model_executor.model_loader import BaseModelLoader
 from vllm.model_executor.model_loader.utils import get_model_architecture
 
@@ -53,15 +53,24 @@ class TTModelLoader(BaseModelLoader):
         if "vllm_config" in init_params:
             extra_kwargs["vllm_config"] = vllm_config
 
-        model = model_class.initialize_vllm_model(
-            model_config.hf_config,
-            device_config.device,
-            max_batch_size,
-            max_seq_len=model_config.max_model_len,
-            tt_data_parallel=tt_data_parallel,
-            optimizations=optimizations,
-            **extra_kwargs,
-        )
+        # Build the model inside the current-vLLM-config context, the same way
+        # upstream's BaseModelLoader.load_model does (it calls initialize_model,
+        # which wraps construction in set_current_vllm_config). Any vLLM layer
+        # built while the model is being constructed may look the config up
+        # through get_current_vllm_config() -- CustomOp subclasses do, and so do
+        # the Pooler methods under vllm.model_executor.layers.pooler. Building
+        # outside the context made serving Qwen3-Embedding fail with
+        # "Current vLLM config is not set" the moment a Pooler was constructed.
+        with set_current_vllm_config(vllm_config, check_compile=False):
+            model = model_class.initialize_vllm_model(
+                model_config.hf_config,
+                device_config.device,
+                max_batch_size,
+                max_seq_len=model_config.max_model_len,
+                tt_data_parallel=tt_data_parallel,
+                optimizations=optimizations,
+                **extra_kwargs,
+            )
         return model
 
     def download_model(self, model_config: ModelConfig) -> None:
