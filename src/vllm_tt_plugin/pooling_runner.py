@@ -98,8 +98,24 @@ class TTPoolingModelRunner:
         return self.model
 
     def warmup_model(self) -> None:
-        """No-op: pooling runs a single un-traced forward, nothing to warm up."""
-        return
+        """Let the pooling model compile its device shapes before serving.
+
+        Pooling runs a single un-traced forward, so there is no trace to capture
+        here, but there is still per-shape kernel compilation: a shape first seen
+        at request time compiles then, and the requesting client waits for it
+        (measured tens of seconds on a TT encoder). Delegate to the model's
+        ``warmup_model_prefill`` -- the same hook ``TTModelRunner`` uses for the
+        decoder models -- so those compiles happen during startup instead.
+
+        Models that do not implement the hook keep the previous no-op behaviour.
+        """
+        warmup_prefill = getattr(self.get_model(), "warmup_model_prefill", None)
+        if warmup_prefill is None:
+            logger.info("Pooling model has no warmup_model_prefill; skipping warmup")
+            return
+        logger.info("Warming up pooling model device shapes...")
+        warmup_prefill(kv_cache=None, enable_trace=False)
+        logger.info("Pooling model warmup complete")
 
     def _prepare_model_inputs(
         self, scheduler_output: SchedulerOutput

@@ -420,8 +420,25 @@ def test_supported_pooling_tasks_empty_for_non_pooling_model(monkeypatch):
     assert runner.get_supported_pooling_tasks() == []
 
 
-def test_warmup_is_noop():
+def test_warmup_delegates_to_the_model_hook():
+    """Per-shape kernel compilation must happen at startup, not on the request
+    that first uses a shape, so the runner drives the model's warmup hook."""
     runner = _bare_runner()
+    model = _FakeModel(width=8)
+    calls = []
+    model.warmup_model_prefill = lambda **kwargs: calls.append(kwargs)
+    runner.model = model
+
+    assert runner.warmup_model() is None
+    assert calls == [{"kv_cache": None, "enable_trace": False}]
+
+
+def test_warmup_is_noop_without_a_model_hook():
+    """A pooling model that does not implement the hook keeps working; warmup is
+    an optimisation, not a requirement."""
+    runner = _bare_runner()
+    runner.model = _FakeModel(width=8)  # no warmup_model_prefill attribute
+
     assert runner.warmup_model() is None
 
 
