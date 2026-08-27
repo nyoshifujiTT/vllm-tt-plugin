@@ -348,9 +348,10 @@ class TTPoolingModelRunner:
         the model's ``pooler`` (``model.pooler.get_supported_tasks()``) instead
         of hard-coding a task list in the runner. The supported tasks are a
         property of the model's Pooler -- an embed Pooler reports ``embed``, a
-        cross-encoder / reranker ClassifierPooler reports ``classify`` /
-        ``score`` -- so the runner must not second-guess it. A non-pooling model
-        reports nothing.
+        cross-encoder / reranker ClassifierPooler reports ``classify`` (the
+        cross-encoder pooling task, which is what routes ``/score`` and
+        ``/rerank``) -- so the runner must not second-guess it. A non-pooling
+        model reports nothing.
         """
         model = self.get_model()
         if not is_pooling_model(model):

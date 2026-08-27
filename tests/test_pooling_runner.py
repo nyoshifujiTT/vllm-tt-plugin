@@ -82,9 +82,10 @@ def _bare_runner(max_num_seqs: int = 8) -> TTPoolingModelRunner:
 
 def _req(req_id: str, prompt_token_ids, task="embed"):
     """A scheduled request. ``task`` seeds ``pooling_params.task`` (the vLLM
-    per-request PoolingTask: ``"embed"`` for embeddings, ``"score"`` /
-    ``"classify"`` for cross-encoder reranking). vLLM's PoolingMetadata requires
-    every request to carry a task, so it defaults to ``"embed"`` here."""
+    per-request PoolingTask: ``"embed"`` for embeddings, ``"classify"`` for
+    cross-encoder reranking -- the names in ``vllm.tasks.PoolingTask``). vLLM's
+    PoolingMetadata requires every request to carry a task, so it defaults to
+    ``"embed"`` here."""
     return SimpleNamespace(
         req_id=req_id,
         prompt_token_ids=list(prompt_token_ids),
@@ -242,14 +243,14 @@ def test_pooler_present_receives_correct_pooling_metadata():
     out = runner.execute_model(
         _scheduler_output(
             [
-                _req("q0", [1, 2, 3, 4], task="score"),
-                _req("q1", [5], task="score"),
+                _req("q0", [1, 2, 3, 4], task="classify"),
+                _req("q1", [5], task="classify"),
             ]
         )
     )
     meta = model.pooler.seen
     assert list(meta.prompt_lens) == [4, 1]
-    assert [p.task for p in meta.pooling_params] == ["score", "score"]
+    assert [p.task for p in meta.pooling_params] == ["classify", "classify"]
     # Classifier stub passes the [B, 1] logit through untouched (no normalize).
     assert out.pooler_output[0].item() == 1.0
     assert out.pooler_output[1].item() == 2.0
@@ -339,7 +340,7 @@ def test_pool_via_model_pooler_tolerates_non_torch_device_hidden():
     # its own on-device gather. The embedding path (real torch tensor) is
     # exercised by test_pool_via_model_pooler_drives_a_real_vllm_pooler above.
     runner = _bare_runner()
-    reqs = [_req("a", [10, 11, 12], task="score"), _req("b", [20, 21], task="score")]
+    reqs = [_req("a", [10, 11, 12], task="classify"), _req("b", [20, 21], task="classify")]
     pooler = _DeviceNativePooler()
     hidden = _FakeTTNNHidden(rows=[2.0, 4.0])
 
@@ -402,14 +403,15 @@ def test_supported_pooling_tasks_delegate_to_model_pooler(monkeypatch):
 
 
 def test_supported_pooling_tasks_report_reranker_tasks(monkeypatch):
-    # A cross-encoder / reranker model advertises classify/score, proving the
-    # runner no longer forces every pooling model onto the embed task.
+    # A cross-encoder / reranker model advertises "classify" (the cross-encoder
+    # pooling task), proving the runner no longer forces every pooling model
+    # onto the embed task.
     monkeypatch.setattr(pooling_runner_mod, "is_pooling_model", lambda model: True)
     runner = _bare_runner()
     model = _FakeModel(width=1)
-    model.pooler.get_supported_tasks = lambda: {"classify", "score"}
+    model.pooler.get_supported_tasks = lambda: {"classify"}
     runner.model = model
-    assert set(runner.get_supported_pooling_tasks()) == {"classify", "score"}
+    assert set(runner.get_supported_pooling_tasks()) == {"classify"}
 
 
 def test_supported_pooling_tasks_empty_for_non_pooling_model(monkeypatch):
