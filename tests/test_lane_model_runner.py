@@ -102,6 +102,7 @@ def test_extract_output_device_decode_returns_scheduled_rows_in_order():
             enable_log_probs=torch.zeros(5, dtype=torch.bool)
         ),
         max_num_logprobs=[None],
+        grammar_bitmask=[None],
     )
 
     sampled, logprobs = batch.extract_output(
@@ -128,6 +129,7 @@ def test_extract_output_device_prefill_returns_front_packed_tokens():
         ),
         max_num_logprobs=[None],
         intermediate_prefill_mask=None,
+        grammar_bitmask=[None],
     )
 
     sampled, logprobs = batch.extract_output(
@@ -253,7 +255,9 @@ def test_build_host_generators_preserves_intermediate_request_rng():
 
 def test_get_output_tokens_skips_all_intermediate_prefill_rows():
     runner = SimpleNamespace(
-        host_sampler=lambda *args, **kwargs: pytest.fail("sampler must not run")
+        host_sampler=lambda *args, **kwargs: pytest.fail("sampler must not run"),
+        _is_block_output_model=False,
+        _output_tokens_per_step=1,
     )
     model_input = SimpleNamespace(intermediate_prefill_mask=torch.tensor([True]))
 
@@ -297,6 +301,7 @@ def test_finish_lane_sync_suppresses_intermediate_prefill_output():
             num_tokens=[8],
         ),
         apply_and_build_runner_output=unexpected_final_output,
+        _output_tokens_per_step=1,
     )
 
     def build_chunked_prefill_output(**kwargs):
