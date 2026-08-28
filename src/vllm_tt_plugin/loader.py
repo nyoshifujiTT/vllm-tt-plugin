@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
 
 from torch import nn
-from vllm.config import ModelConfig, VllmConfig
+from vllm.config import ModelConfig, VllmConfig, set_current_vllm_config
 from vllm.model_executor.model_loader import BaseModelLoader
 from vllm.model_executor.model_loader.utils import get_model_architecture
 
@@ -35,15 +35,24 @@ class TTModelLoader(BaseModelLoader):
         tt_data_parallel = get_tt_data_parallel_size(vllm_config)
         max_batch_size = get_tt_max_batch_size(vllm_config)
 
-        model = model_class.initialize_vllm_model(
-            model_config.hf_config,
-            device_config.device,
-            max_batch_size,
-            max_seq_len=model_config.max_model_len,
-            tt_data_parallel=tt_data_parallel,
-            optimizations=optimizations,
-        )
-        return model
+        # Build the model inside vLLM's config context, as upstream's loader
+        # does (model_loader/utils.py::initialize_model wraps construction in
+        # set_current_vllm_config). Model code is entitled to read the ambient
+        # config while it is being constructed -- upstream's own layers do, e.g.
+        # pooler_for_classify() calls get_current_vllm_config() to resolve a
+        # classification head's activation instead of taking it as an argument.
+        # Without this context such a lookup finds nothing, and the TT path could
+        # not pass the config explicitly either: initialize_vllm_model does not
+        # take vllm_config on most TT models.
+        with set_current_vllm_config(vllm_config):
+            return model_class.initialize_vllm_model(
+                model_config.hf_config,
+                device_config.device,
+                max_batch_size,
+                max_seq_len=model_config.max_model_len,
+                tt_data_parallel=tt_data_parallel,
+                optimizations=optimizations,
+            )
 
     def download_model(self, model_config: ModelConfig) -> None:
         """Download a model so that it can be immediately loaded."""

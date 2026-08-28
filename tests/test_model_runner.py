@@ -58,6 +58,7 @@ def _fake_runner(batch: InputBatch, request: CachedRequestState) -> SimpleNamesp
     return SimpleNamespace(
         input_batch=batch,
         requests={"r": request},
+        _output_tokens_per_step=1,
         tt_per_lane_max_num_seqs=MAX_NUM_SEQS,
         tt_data_parallel_size=DP_SIZE,
         max_num_blocks_per_req=MAX_MODEL_LEN // BLOCK_SIZE,
@@ -70,6 +71,24 @@ def _fake_runner(batch: InputBatch, request: CachedRequestState) -> SimpleNamesp
         _decode_layout_changed_since_last_decode=False,
         _build_host_generators=TTModelRunner._build_host_generators,
     )
+
+
+def _prepare(runner, *rows):
+    """Run _prepare_model_inputs for cached rows of
+    (req_id, num_scheduled, num_computed, num_output)."""
+    out = SchedulerOutput.make_empty()
+    out.num_scheduled_tokens = {r: s for r, s, _, _ in rows}
+    out.total_num_scheduled_tokens = sum(s for _, s, _, _ in rows)
+    out.scheduled_cached_reqs = CachedRequestData(
+        req_ids=[r for r, *_ in rows],
+        resumed_req_ids=set(),
+        new_token_ids=[[] for _ in rows],
+        all_token_ids={},
+        new_block_ids=[None for _ in rows],
+        num_computed_tokens=[c for _, _, c, _ in rows],
+        num_output_tokens=[o for *_, o in rows],
+    )
+    return TTModelRunner._prepare_model_inputs(runner, out, None)
 
 
 # endregion Test helpers
@@ -161,9 +180,12 @@ def test_resumed_replay_past_prompt_length_remains_prefill():
 # region Decode input construction
 
 
-def test_completed_cached_request_builds_decode_input():
-    prompt_len = num_computed_tokens = 8
-    output_len = 0
+@pytest.mark.parametrize("output_len", [0, 1, 2, 5])
+def test_completed_cached_request_builds_decode_input(output_len: int):
+    """Classify a cached request that has computed everything but its last token."""
+    prompt_len = 8
+    num_tokens = prompt_len + output_len
+    num_computed_tokens = max(prompt_len, num_tokens - 1)
     batch, request = _batch_with_one_request(
         prompt_len=prompt_len,
         output_len=output_len,
@@ -189,10 +211,69 @@ def test_completed_cached_request_builds_decode_input():
 
     assert model_input is not None
     assert model_input.prompt_lens is None
-    assert model_input.input_positions.tolist() == [prompt_len - 1] + [-1] * (
+    assert model_input.input_positions.tolist() == [num_tokens - 1] + [-1] * (
         MAX_NUM_SEQS - 1
     )
     assert model_input.input_tokens.shape == (MAX_NUM_SEQS, 1)
+    assert model_input.input_tokens[0, 0] == batch.token_ids_cpu[0, num_tokens - 1]
+
+
+def test_final_one_token_prompt_chunk_stays_prefill():
+    """Even a one-token prompt remainder is prefill work: the prefill path
+    owns chunk bookkeeping (intermediate mask, vision rope state)."""
+    batch, request = _batch_with_one_request(8, 0, num_computed_tokens=7)
+
+    model_input = _prepare(_fake_runner(batch, request), ("r", 1, 7, 0))
+
+    assert model_input.prompt_lens.tolist() == [8]
+    assert model_input.intermediate_prefill_mask.tolist() == [False]
+
+
+def test_mixed_prefill_batch_keeps_scheduled_decode_row():
+    """A scheduled row must never be dropped from a prefill step: the output
+    row count desyncs and the dropped token is never rescheduled."""
+    batch, chunking = _batch_with_one_request(8, 0, num_computed_tokens=2)
+    steady = CachedRequestState(
+        req_id="r2",
+        prompt_token_ids=list(range(8)),
+        mm_features=None,
+        sampling_params=SamplingParams(temperature=0.0),
+        generator=None,
+        block_ids=([1],),
+        num_computed_tokens=8,
+        output_token_ids=[100],
+    )
+    batch.add_request(steady)
+
+    model_input = _prepare(
+        _fake_runner(batch, chunking), ("r", 2, 2, 0), ("r2", 1, 8, 1)
+    )
+
+    # Chunk end 2+2=4 (mid-prompt) and the steady row's 8+1=9 both stay.
+    assert sorted(model_input.prompt_lens.tolist()) == [4, 9]
+
+
+def test_steady_block_step_builds_decode_input():
+    """One whole canvas outstanding is the block steady state; dispatching it
+    as prompt work re-encodes the entire session per canvas."""
+    batch, request = _batch_with_one_request(8, 16, num_computed_tokens=8)
+    runner = _fake_runner(batch, request)
+    runner._output_tokens_per_step = 16
+
+    model_input = _prepare(runner, ("r", 16, 8, 16))
+
+    assert model_input.prompt_lens is None
+
+
+def test_block_resume_replay_past_one_canvas_remains_prefill():
+    """More than one canvas outstanding is uncomputed replay history."""
+    batch, request = _batch_with_one_request(8, 16, num_computed_tokens=8)
+    runner = _fake_runner(batch, request)
+    runner._output_tokens_per_step = 8
+
+    model_input = _prepare(runner, ("r", 8, 8, 16))
+
+    assert model_input.prompt_lens.tolist() == [16]
 
 
 # endregion Decode input construction
