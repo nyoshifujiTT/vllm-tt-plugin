@@ -1,0 +1,5 @@
+{
+  "arch": "Qwen3ForCausalLM",
+  "main_class": "models.demos.qwen3_embedding.tt.generator_vllm:Qwen3EmbeddingForTTvLLM",
+  "note": "Qwen3-Embedding (0.6B / 8B). The HF checkpoint declares architectures=['Qwen3ForCausalLM']; serve with --task embed (runner_type=pooling) so vLLM routes it through the TT pooling runner. The adapter exposes a real embed Pooler and returns the flat per-token hidden the pooling runner feeds to model.pooler. Drop this folder under EXTRA_MODELS_DIR to register it without editing the plugin; the plugin prepends its TT convention, registering TTQwen3ForCausalLM -> main_class."
+}

@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
 
+import inspect
+
 from torch import nn
 from vllm.config import ModelConfig, VllmConfig, set_current_vllm_config
 from vllm.model_executor.model_loader import BaseModelLoader
@@ -35,6 +37,22 @@ class TTModelLoader(BaseModelLoader):
         tt_data_parallel = get_tt_data_parallel_size(vllm_config)
         max_batch_size = get_tt_max_batch_size(vllm_config)
 
+        # Some pooling wrappers also want the resolved VllmConfig handed to them
+        # directly: their Pooler is built from vllm_config.model_config
+        # .pooler_config, which carries the pooling type and activation vLLM
+        # derived from the checkpoint plus any --override-pooler-config. Pass it
+        # only to wrappers that accept it, so generative models -- whose
+        # initialize_vllm_model has a fixed signature -- are unaffected.
+        extra_kwargs = {}
+        try:
+            init_params = inspect.signature(
+                model_class.initialize_vllm_model
+            ).parameters
+        except (TypeError, ValueError):
+            init_params = {}
+        if "vllm_config" in init_params:
+            extra_kwargs["vllm_config"] = vllm_config
+
         # Build the model inside vLLM's config context, as upstream's loader
         # does (model_loader/utils.py::initialize_model wraps construction in
         # set_current_vllm_config). Model code is entitled to read the ambient
@@ -52,6 +70,7 @@ class TTModelLoader(BaseModelLoader):
                 max_seq_len=model_config.max_model_len,
                 tt_data_parallel=tt_data_parallel,
                 optimizations=optimizations,
+                **extra_kwargs,
             )
 
     def download_model(self, model_config: ModelConfig) -> None:
