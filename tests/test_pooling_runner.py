@@ -82,9 +82,10 @@ def _bare_runner(max_num_seqs: int = 8) -> TTPoolingModelRunner:
 
 def _req(req_id: str, prompt_token_ids, task="embed"):
     """A scheduled request. ``task`` seeds ``pooling_params.task`` (the vLLM
-    per-request PoolingTask: ``"embed"`` for embeddings, ``"score"`` /
-    ``"classify"`` for cross-encoder reranking). vLLM's PoolingMetadata requires
-    every request to carry a task, so it defaults to ``"embed"`` here."""
+    per-request PoolingTask: ``"embed"`` for embeddings, ``"classify"`` for
+    cross-encoder reranking -- the names in ``vllm.tasks.PoolingTask``). vLLM's
+    PoolingMetadata requires every request to carry a task, so it defaults to
+    ``"embed"`` here."""
     return SimpleNamespace(
         req_id=req_id,
         prompt_token_ids=list(prompt_token_ids),
@@ -113,8 +114,14 @@ class _FakeModel:
         self.seen = None
         self.pooler = _StubIdentityPooler()
 
-    def forward(self, input_ids, attention_mask):
+    def forward(self, input_ids, attention_mask, return_full_hidden_states=False):
+        # The canonical runner always delegates to model.pooler, so it asks for
+        # the un-pooled hidden with return_full_hidden_states=True. The fake
+        # model returns the same fixed-width rows either way (the stub poolers
+        # decide what to do with them); it records the flag so a test can assert
+        # the runner requested full hidden states.
         self.seen = (input_ids, attention_mask)
+        self.seen_return_full_hidden_states = return_full_hidden_states
         batch = input_ids.shape[0]
         # Row i -> vector filled with (i + 1), so per-request identity is checkable.
         out = torch.arange(1, batch + 1, dtype=torch.float32).reshape(batch, 1)
@@ -236,14 +243,14 @@ def test_pooler_present_receives_correct_pooling_metadata():
     out = runner.execute_model(
         _scheduler_output(
             [
-                _req("q0", [1, 2, 3, 4], task="score"),
-                _req("q1", [5], task="score"),
+                _req("q0", [1, 2, 3, 4], task="classify"),
+                _req("q1", [5], task="classify"),
             ]
         )
     )
     meta = model.pooler.seen
     assert list(meta.prompt_lens) == [4, 1]
-    assert [p.task for p in meta.pooling_params] == ["score", "score"]
+    assert [p.task for p in meta.pooling_params] == ["classify", "classify"]
     # Classifier stub passes the [B, 1] logit through untouched (no normalize).
     assert out.pooler_output[0].item() == 1.0
     assert out.pooler_output[1].item() == 2.0
@@ -288,6 +295,62 @@ def test_pool_via_model_pooler_drives_a_real_vllm_pooler():
     assert len(out) == 2
     assert torch.allclose(out[0], torch.full((4,), 2.0))  # req a last token
     assert torch.allclose(out[1], torch.full((4,), 4.0))  # req b last token
+
+
+@_requires_pool_metadata
+def test_runner_requests_full_hidden_states_from_forward():
+    # The canonical runner delegates all pooling to model.pooler, so it must ask
+    # forward for the un-pooled hidden with return_full_hidden_states=True (the
+    # fork runner leaves it default-off and gets the pooled pass-through).
+    runner = _bare_runner()
+    model = _FakeModel(width=4)
+    runner.model = model
+    runner.execute_model(_scheduler_output([_req("a", [1, 2, 3])]))
+    assert model.seen_return_full_hidden_states is True
+
+
+class _FakeTTNNHidden:
+    """Stand-in for a device (ttnn) hidden state whose ``.device`` is a method,
+    not a ``torch.device`` (matches ttnn.Tensor). Used to prove the runner
+    builds the pooling cursor without assuming a torch device."""
+
+    def __init__(self, rows):
+        self._rows = rows
+
+    def device(self):  # ttnn.Tensor.device is a method returning a MeshDevice
+        raise AssertionError("device() must not be called as a torch attribute")
+
+
+class _DeviceNativePooler:
+    """Stub TT-native pooler: indexes its own device hidden (ignores the torch
+    cursor's device) and returns one host logit per request."""
+
+    def __init__(self):
+        self.seen = None
+
+    def __call__(self, hidden_states, pooling_metadata):
+        self.seen = pooling_metadata
+        return [torch.tensor([float(r)]) for r in hidden_states._rows]
+
+
+@_requires_pool_metadata
+def test_pool_via_model_pooler_tolerates_non_torch_device_hidden():
+    # A device-native (ttnn-like) hidden exposes no torch ``.device``; the runner
+    # must still build a valid cursor (on CPU) and drive the pooler, which does
+    # its own on-device gather. The embedding path (real torch tensor) is
+    # exercised by test_pool_via_model_pooler_drives_a_real_vllm_pooler above.
+    runner = _bare_runner()
+    reqs = [_req("a", [10, 11, 12], task="classify"), _req("b", [20, 21], task="classify")]
+    pooler = _DeviceNativePooler()
+    hidden = _FakeTTNNHidden(rows=[2.0, 4.0])
+
+    out = runner._pool_via_model_pooler(pooler, hidden, reqs)
+
+    assert len(out) == 2
+    assert out[0].item() == 2.0
+    assert out[1].item() == 4.0
+    # The cursor was built (prompt_lens match) despite the non-torch hidden.
+    assert list(pooler.seen.prompt_lens) == [3, 2]
 
 
 @_requires_pool_metadata
@@ -340,14 +403,15 @@ def test_supported_pooling_tasks_delegate_to_model_pooler(monkeypatch):
 
 
 def test_supported_pooling_tasks_report_reranker_tasks(monkeypatch):
-    # A cross-encoder / reranker model advertises classify/score, proving the
-    # runner no longer forces every pooling model onto the embed task.
+    # A cross-encoder / reranker model advertises "classify" (the cross-encoder
+    # pooling task), proving the runner no longer forces every pooling model
+    # onto the embed task.
     monkeypatch.setattr(pooling_runner_mod, "is_pooling_model", lambda model: True)
     runner = _bare_runner()
     model = _FakeModel(width=1)
-    model.pooler.get_supported_tasks = lambda: {"classify", "score"}
+    model.pooler.get_supported_tasks = lambda: {"classify"}
     runner.model = model
-    assert set(runner.get_supported_pooling_tasks()) == {"classify", "score"}
+    assert set(runner.get_supported_pooling_tasks()) == {"classify"}
 
 
 def test_supported_pooling_tasks_empty_for_non_pooling_model(monkeypatch):
@@ -358,8 +422,25 @@ def test_supported_pooling_tasks_empty_for_non_pooling_model(monkeypatch):
     assert runner.get_supported_pooling_tasks() == []
 
 
-def test_warmup_is_noop():
+def test_warmup_delegates_to_the_model_hook():
+    """Per-shape kernel compilation must happen at startup, not on the request
+    that first uses a shape, so the runner drives the model's warmup hook."""
     runner = _bare_runner()
+    model = _FakeModel(width=8)
+    calls = []
+    model.warmup_model_prefill = lambda **kwargs: calls.append(kwargs)
+    runner.model = model
+
+    assert runner.warmup_model() is None
+    assert calls == [{"kv_cache": None, "enable_trace": False}]
+
+
+def test_warmup_is_noop_without_a_model_hook():
+    """A pooling model that does not implement the hook keeps working; warmup is
+    an optimisation, not a requirement."""
+    runner = _bare_runner()
+    runner.model = _FakeModel(width=8)  # no warmup_model_prefill attribute
+
     assert runner.warmup_model() is None
 
 

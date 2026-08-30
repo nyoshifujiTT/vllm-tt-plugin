@@ -40,7 +40,9 @@ from vllm_tt_plugin.async_decode import (
 from vllm_tt_plugin.config import (
     get_tt_data_parallel_size,
     get_tt_max_batch_size,
+    get_tt_output_tokens_per_step,
     get_tt_per_lane_max_num_seqs,
+    is_tt_block_output_model,
 )
 from vllm_tt_plugin.input_batch import (
     SEED_NONE_SENTINEL,
@@ -114,6 +116,29 @@ class _SyncForward:
     is_decode: bool
 
 
+def _coerce_output_block(
+    sampled_token_ids: torch.Tensor, num_reqs: int, width: int
+) -> torch.Tensor:
+    """Validate one step's sampled tokens against the output-width contract.
+
+    Returns the tensor shaped ``[num_reqs, width]`` (reshaping the empty
+    tensor) or raises when the model output violates the contract.
+    """
+    assert sampled_token_ids.shape[0] == num_reqs, (
+        f"Number of request outputs {sampled_token_ids.shape[0]} != "
+        f"number of requests in input batch {num_reqs}"
+    )
+    if num_reqs == 0 and sampled_token_ids.numel() == 0:
+        sampled_token_ids = sampled_token_ids.reshape(0, width)
+    if sampled_token_ids.dim() != 2 or sampled_token_ids.shape[1] != width:
+        raise ValueError(
+            "Model output width violates output_tokens_per_step: "
+            f"got shape {tuple(sampled_token_ids.shape)}, expected "
+            f"[num_requests, {width}]"
+        )
+    return sampled_token_ids
+
+
 class TTModelRunner:
     def __init__(
         self,
@@ -133,6 +158,9 @@ class TTModelRunner:
         self.speculative_config = vllm_config.speculative_config
         self.observability_config = vllm_config.observability_config
         self.device_config = vllm_config.device_config
+        self._output_tokens_per_step = get_tt_output_tokens_per_step(vllm_config)
+        self._is_block_output_model = is_tt_block_output_model(vllm_config)
+        self._persistent_capture_released = False
 
         if self.model_config.is_encoder_decoder:
             raise ValueError("Encoder-decoder models aren't yet supported for TT")
@@ -230,6 +258,27 @@ class TTModelRunner:
             is_pooling_model=False,
             custom_logitsprocs=(self.model_config.logits_processors or ()),
         )
+
+    def shutdown(self) -> None:
+        """Deterministically release optional model-lifetime captures.
+
+        Called from ``TTWorker.shutdown`` while the mesh is still open. This
+        is intentionally not wired to ``__del__``: the runner sits in
+        reference cycles, so a destructor can fire during interpreter
+        teardown after the devices closed, where a device-side release is
+        worse than leaking the capture to process exit.
+        """
+        if getattr(self, "_persistent_capture_released", False):
+            return
+        release = getattr(
+            getattr(self, "model", None), "release_persistent_capture", None
+        )
+        if callable(release):
+            try:
+                release()
+            except Exception:
+                logger.exception("Failed to release persistent model capture")
+        self._persistent_capture_released = True
 
     @property
     def lane_batch(self) -> TTLaneInputBatch:
@@ -336,6 +385,8 @@ class TTModelRunner:
                 block_sizes=per_group_block_sizes,
                 kernel_block_sizes=per_group_block_sizes,
                 logitsprocs=self._host_logitsprocs,
+                disable_logprobs=self._is_block_output_model,
+                output_tokens_per_step=self._output_tokens_per_step,
             )
         else:
             self.input_batch = InputBatch(
@@ -346,6 +397,8 @@ class TTModelRunner:
                 block_sizes=per_group_block_sizes,
                 kernel_block_sizes=per_group_block_sizes,
                 logitsprocs=self._host_logitsprocs,
+                disable_logprobs=self._is_block_output_model,
+                output_tokens_per_step=self._output_tokens_per_step,
             )
 
         # The block tables in the persistent input batch have
@@ -593,6 +646,18 @@ class TTModelRunner:
             )
         return per_layer  # type: ignore[return-value]
 
+    def _release_model_request(self, req_id: str) -> None:
+        """Release model-owned state while the slot mapping is still valid.
+
+        State follows the request's ``_req_state_slot`` slot, not its batch
+        row: prefill can park a request at a slot other than its row when the
+        preferred row is held (``_alloc_prefill_state_slots``).
+        """
+        slot = self._req_state_slot.get(req_id)
+        release = getattr(getattr(self, "model", None), "release_request", None)
+        if slot is not None and callable(release):
+            release(slot)
+
     def _update_states(self, scheduler_output: SchedulerOutput) -> None:
         """Update the cached states and the persistent batch with the
         scheduler output.
@@ -605,7 +670,6 @@ class TTModelRunner:
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
-        self._release_dead_state_slots(scheduler_output)
 
         # Remove the finished requests from the persistent batch.
         # NOTE(woosuk): There could be an edge case where finished_req_ids and
@@ -615,6 +679,7 @@ class TTModelRunner:
         # and handling the second as a new request.
         removed_req_indices: list[int] = []
         for req_id in scheduler_output.finished_req_ids:
+            self._release_model_request(req_id)
             req_index = self.input_batch.remove_request(req_id)
             if req_index is not None:
                 removed_req_indices.append(req_index)
@@ -623,6 +688,15 @@ class TTModelRunner:
         # Free the cached encoder outputs.
         for mm_hash in scheduler_output.free_encoder_mm_hashes:
             self.encoder_cache.pop(mm_hash, None)
+
+        # Explicit preemption invalidates model-owned request state. Temporary
+        # unscheduling does not: a request may simply be hidden for this step.
+        for req_id in scheduler_output.preempted_req_ids or ():
+            self._release_model_request(req_id)
+
+        # Only after the model released by slot: the release calls above read
+        # the request's slot from the ownership map before it is dropped.
+        self._release_dead_state_slots(scheduler_output)
 
         # Remove the unscheduled requests from the persistent batch.
         # NOTE(woosuk): The unscheduled requests are either preempted requests
@@ -1032,9 +1106,24 @@ class TTModelRunner:
         num_scheduled = scheduler_output.num_scheduled_tokens
 
         def _is_still_prefilling(req_id: str) -> bool:
+            # Any uncomputed PROMPT token is prefill work, including a final
+            # chunk of exactly one token: prompt work must dispatch through
+            # the prefill path, which owns chunk bookkeeping (e.g. the
+            # intermediate-prefill mask and vision rope state). Past the
+            # prompt, a steady-state step legitimately has exactly one output
+            # width outstanding (the sampled token for AR, one whole canvas
+            # for block models); only MORE than that means uncomputed history
+            # (preemption-resume replay). A plain ``computed < total``
+            # comparison dispatched every post-first block step as prompt
+            # work, re-encoding the entire session per canvas: quadratic
+            # prefill and decode never ran.
             row = input_batch.req_id_to_index[req_id]
+            # ``num_computed_tokens`` is the scheduler's pre-step snapshot.
+            num_computed = input_batch.num_computed_tokens_cpu[row]
             return (
-                input_batch.num_computed_tokens_cpu[row] < input_batch.num_tokens[row]
+                num_computed < input_batch.num_prompt_tokens[row]
+                or num_computed + self._output_tokens_per_step
+                < input_batch.num_tokens[row]
             )
 
         # A "prefill" step can contain:
@@ -1057,45 +1146,6 @@ class TTModelRunner:
         sample_params = input_batch.sampling
         intermediate_prefill_mask: torch.Tensor | None = None
         if is_prompt:
-            # NOTE: In SchedulerOutput, "cached" means "request data already
-            # cached on the worker", not necessarily "decode". During a prefill
-            # step we can legitimately see cached requests if they are resumed
-            # from preemption or are chunked-prefill continuations (both still
-            # prefill work).
-            if cached_reqs.num_reqs > 0:
-                running_req_ids = {
-                    req_id
-                    for req_id in cached_reqs.req_ids
-                    if req_id not in cached_reqs.resumed_req_ids
-                    and not _is_still_prefilling(req_id)
-                }
-                if running_req_ids:
-                    # Mixed prefill+decode batch detected. This should not
-                    # happen with TTScheduler but can occur under standard DP
-                    # async scheduling edge cases. Filter decode requests out
-                    # of this prefill step; they will be re-scheduled next.
-
-                    logger.warning(
-                        "Prefill batch contained %d running decode request(s); "
-                        "filtering them from this prefill step.",
-                        len(running_req_ids),
-                    )
-
-                    req_indices = [
-                        i
-                        for i in req_indices
-                        if input_batch.req_ids[i] not in running_req_ids
-                    ]
-                    num_reqs = len(req_indices)
-                    if num_reqs == 0:
-                        return None
-
-                    # Rebuild block tables for the filtered indices.
-                    block_tables_per_group = input_batch.block_tables_for_rows(
-                        req_indices, target_width
-                    )
-                    block_tables = block_tables_per_group[0]
-
             # num_computed_tokens for each request is the input position
             # (=computed previously and cached)
             input_positions = input_batch.num_computed_tokens_cpu[req_indices]
@@ -1164,6 +1214,8 @@ class TTModelRunner:
                 # defaults. The persistent ``input_batch.sampling`` tail is
                 # never read, so there is nothing to default in place.
 
+        row_req_ids = [input_batch.req_ids[i] for i in req_indices]
+
         tt_sampling_params = slice_tt_sampling_params(sample_params, req_indices)
         if not is_prompt and input_tokens.shape[0] > len(req_indices):
             # Decode inputs are padded to the rank batch size; pad the sampling
@@ -1202,8 +1254,7 @@ class TTModelRunner:
             bitmask = reorder_grammar_bitmask_for_tt_batch(
                 bitmask=bitmask,
                 structured_output_request_ids=structured_output_request_ids,
-                req_id_to_index=input_batch.req_id_to_index,
-                req_indices=req_indices,
+                row_req_ids=row_req_ids,
                 batch_length=batch_length,
             )
 
@@ -1300,7 +1351,6 @@ class TTModelRunner:
         # State follows the request, not the row (``self._req_state_slot``), which
         # subsumes the batch's condense-move remap.
         input_batch.reset_slot_remap()
-        row_req_ids = [input_batch.req_ids[i] for i in req_indices]
         prefill_empty_slots = None
         slot_remap = None
         if is_prompt:
@@ -1319,6 +1369,7 @@ class TTModelRunner:
             block_tables_per_group=block_tables_per_group,
             block_tables_per_layer=self._block_tables_per_layer(block_tables_per_group),
             unpadded_batch_size=num_reqs,
+            row_req_ids=row_req_ids,
             tt_sampling_params=tt_sampling_params,
             multi_modal_kwargs=multi_modal_kwargs,
             perform_device_sampling=perform_device_sampling,
@@ -1607,23 +1658,20 @@ class TTModelRunner:
         *,
         lane_total: int | None,
     ) -> torch.Tensor | None:
-        """Reorder a scheduler grammar bitmask into TT batch layout, or ``None``.
-
-        Runs at sample time. ``sample_tokens`` executes before the next
-        schedule, so the live batch/lane layout still matches the forward this
-        bitmask belongs to. ``lane_total`` selects the lane reorder (full slot
-        capacity) over the non-DP front-packed reorder.
-        """
+        """Reorder a scheduler grammar bitmask into TT batch layout, or ``None``."""
         if grammar_output is None or grammar_output.grammar_bitmask is None:
             return None
+
         if lane_total is not None:
             return self.lane_batch.slot_grammar_bitmask(grammar_output, lane_total)
+
+        assert model_input.row_req_ids is not None
+
         bitmask = torch.from_numpy(grammar_output.grammar_bitmask)
         return reorder_grammar_bitmask_for_tt_batch(
             bitmask=bitmask,
             structured_output_request_ids=grammar_output.structured_output_request_ids,
-            req_id_to_index=self.input_batch.req_id_to_index,
-            req_indices=list(range(self.input_batch.num_reqs)),
+            row_req_ids=model_input.row_req_ids,
             batch_length=model_input.input_tokens.shape[0],
         )
 
@@ -1681,22 +1729,32 @@ class TTModelRunner:
         logprobs_tensors = logprobs_per_dp[0] if logprobs_per_dp else None
         logprobs = logprobs_tensors.tolists() if logprobs_tensors else None
 
-        if not fwd.is_decode and fwd.model_input.prompt_lens is not None:
-            num_reqs = self.input_batch.num_reqs
-            prompt_lens = np.asarray(fwd.model_input.prompt_lens)
-            # A row-count mismatch means the forward ran on a filtered subset;
-            # leave it to the output builder below to report.
-            if len(prompt_lens) == num_reqs:
-                intermediate_mask = prompt_lens < self.input_batch.num_tokens[:num_reqs]
-                if intermediate_mask.any():
-                    return self._build_chunked_prefill_output(
-                        req_ids=list(self.input_batch.req_ids[:num_reqs]),
-                        sampled_token_ids=sampled_token_ids,
-                        logprobs=logprobs,
-                        intermediate_mask=intermediate_mask,
-                    )
+        row_req_ids = fwd.model_input.row_req_ids
 
-        return self.apply_and_build_runner_output(sampled_token_ids, logprobs)
+        assert row_req_ids is not None
+
+        is_prefill = not fwd.is_decode and fwd.model_input.prompt_lens is not None
+
+        if is_prefill:
+            intermediate_mask = fwd.model_input.intermediate_prefill_mask
+
+            assert intermediate_mask is not None
+
+            if intermediate_mask.any():
+                return self._build_chunked_prefill_output(
+                    req_ids=row_req_ids,
+                    sampled_token_ids=sampled_token_ids,
+                    logprobs=logprobs,
+                    intermediate_mask=intermediate_mask.numpy(),
+                )
+
+        return self.apply_and_build_runner_output(
+            sampled_token_ids,
+            logprobs,
+            # Only a prefill build can filter rows. Decode rows are the front-packed
+            # batch rows, so it keeps the vectorized state write.
+            req_ids=row_req_ids if is_prefill else None,
+        )
 
     def _build_chunked_prefill_output(
         self,
@@ -1712,6 +1770,10 @@ class TTModelRunner:
         tokens without appending output; only rows whose chunk ended the prompt
         emit a token and are applied to runner state.
         """
+        assert self._output_tokens_per_step == 1, (
+            "Chunked-prefill output suppression assumes one sampled token per "
+            "request; block-output models must disable chunked prefill"
+        )
         final_idx_np = np.where(~intermediate_mask)[0]
         if final_idx_np.shape[0] > 0:
             final_idx_tensor = torch.from_numpy(final_idx_np.astype(np.int64))
@@ -1979,7 +2041,9 @@ class TTModelRunner:
         start = 0
         for dp_rank, sz in enumerate(batch_size_per_dp):
             if sz <= 0:
-                sampled_token_ids_per_dp.append(torch.tensor([], dtype=torch.int32))
+                sampled_token_ids_per_dp.append(
+                    torch.empty((0, self._output_tokens_per_step), dtype=torch.int32)
+                )
                 logprobs_per_dp.append(None)
                 if is_decode:
                     # Fixed stride segments per DP rank for decode
@@ -1994,6 +2058,12 @@ class TTModelRunner:
             def _take(tensor: torch.Tensor, _rows: torch.Tensor = rows) -> torch.Tensor:
                 return tensor[_rows]
 
+            if not perform_device_sampling and self._is_block_output_model:
+                raise ValueError(
+                    "Block-output step fell back to host sampling; "
+                    "host sampling cannot construct a multi-token canvas"
+                )
+
             if (
                 not is_decode
                 and model_input.intermediate_prefill_mask is not None
@@ -2001,6 +2071,10 @@ class TTModelRunner:
             ):
                 # Every row is mid-prompt; there is nothing to sample and the
                 # placeholders are dropped when the output is built.
+                assert self._output_tokens_per_step == 1, (
+                    "Intermediate-prefill suppression assumes one sampled token "
+                    "per request"
+                )
                 next_token_ids = torch.zeros(sz, dtype=torch.int32)
                 logprobs_per_dp.append(None)
             elif not perform_device_sampling:
@@ -2127,10 +2201,17 @@ class TTModelRunner:
                 # Capture logprobs for this DP rank
                 logprobs_per_dp.append(sampler_output.logprobs_tensors)
             else:  # sample on device
-                # Normalize TT sampled tokens to 1D [sz]. Prefill can return [sz]
-                # while decode may return [sz, 1]; downstream logprobs packing
-                # expects a flat vector here.
-                next_token_ids = _take(tt_out).reshape(sz)
+                assert model_input.grammar_bitmask[dp_rank] is None, (
+                    "grammar bitmask is set but device sampling can't apply it"
+                )
+
+                next_token_ids = _take(tt_out).reshape(sz, -1)
+                if next_token_ids.shape[1] != self._output_tokens_per_step:
+                    raise ValueError(
+                        "Model output width violates output_tokens_per_step: "
+                        f"{next_token_ids.shape[1]} != "
+                        f"{self._output_tokens_per_step}"
+                    )
                 rank_max_num_logprobs = model_input.max_num_logprobs[dp_rank]
                 # Extract logprobs if available from device sampling
                 # Always tensors - turned into lists only when passing to model
@@ -2139,13 +2220,20 @@ class TTModelRunner:
                 if rank_enable_lp.any():
                     # Sanity check for if we correctly detect
                     # when logprobs are supported.
-                    assert tt_log_probs is not None, (
-                        "model should return logprobs when requested"
-                    )
+                    if next_token_ids.shape[1] != 1:
+                        raise ValueError(
+                            "Device logprobs support one output token per step; "
+                            "block-output requests must reject logprobs"
+                        )
+                    if tt_log_probs is None:
+                        raise ValueError(
+                            "Model did not return device logprobs for a request "
+                            "that enabled them"
+                        )
                     logprobs_per_dp.append(
                         build_device_logprobs(
                             tt_log_probs=tt_log_probs,
-                            sampled_token_ids=next_token_ids,
+                            sampled_token_ids=next_token_ids.reshape(sz),
                             rows=rows,
                             max_num_logprobs=rank_max_num_logprobs or 0,
                         )
@@ -2153,7 +2241,7 @@ class TTModelRunner:
                 else:
                     logprobs_per_dp.append(None)
 
-            sampled_token_ids_per_dp.append(next_token_ids.view(sz, 1))
+            sampled_token_ids_per_dp.append(next_token_ids.reshape(sz, -1))
 
             if is_decode:
                 # Fixed stride segments per DP rank for decode
@@ -2207,12 +2295,11 @@ class TTModelRunner:
             if req_id_to_index is not None
             else {req_id: idx for idx, req_id in enumerate(output_req_ids)}
         )
-        assert sampled_token_ids.shape[0] == num_reqs, (
-            f"Number of request outputs {sampled_token_ids.shape[0]} != "
-            f"number of requests in input batch {num_reqs}"
+        sampled_token_ids = _coerce_output_block(
+            sampled_token_ids, num_reqs, self._output_tokens_per_step
         )
 
-        sampled_token_ids_np = sampled_token_ids.view(num_reqs).numpy()
+        sampled_token_ids_np = sampled_token_ids.numpy()
         if sampled_token_ids_np.dtype != np.int32:
             sampled_token_ids_np = sampled_token_ids_np.astype(np.int32, copy=False)
 
@@ -2220,7 +2307,7 @@ class TTModelRunner:
             (output_req_ids[i] for i in range(num_reqs)), None
         )
         sampled_token_id_lists = [
-            [int(token_id)] for token_id in sampled_token_ids_np.tolist()
+            [int(token_id) for token_id in row] for row in sampled_token_ids_np.tolist()
         ]
 
         return ModelRunnerOutput(
@@ -2246,61 +2333,114 @@ class TTModelRunner:
         # single source of truth for the target row.
         use_captured_req_ids = req_ids is not None
         num_reqs = len(req_ids) if req_ids is not None else self.input_batch.num_reqs
-        assert sampled_token_ids.shape[0] == num_reqs, (
-            f"Number of request outputs {sampled_token_ids.shape[0]} != "
-            f"number of requests in input batch {num_reqs}"
+        sampled_token_ids = _coerce_output_block(
+            sampled_token_ids, num_reqs, self._output_tokens_per_step
         )
-        num_out_tokens = sampled_token_ids.shape[1]
-        assert num_out_tokens == 1, "Currently only supporting 1 output token"
+        num_out_tokens = self._output_tokens_per_step
 
-        sampled_token_ids_np = sampled_token_ids.view(num_reqs).numpy()
+        sampled_token_ids_np = sampled_token_ids.numpy()
         if sampled_token_ids_np.dtype != np.int32:
             sampled_token_ids_np = sampled_token_ids_np.astype(np.int32, copy=False)
+
+        max_model_len = self.model_config.max_model_len
 
         if not use_captured_req_ids:
             rows = np.arange(num_reqs)
             start_idxs = self.input_batch.num_tokens[rows]
-            end_idxs = start_idxs + 1
+            end_idxs = start_idxs + num_out_tokens
             max_end = int(end_idxs.max()) if num_reqs > 0 else 0
-            assert max_end <= self.model_config.max_model_len, (
-                "Sampled token IDs exceed the max model length. "
-                f"Total number of tokens: {max_end} > max_model_len: "
-                f"{self.model_config.max_model_len}"
-            )
-
-            self.input_batch.token_ids_cpu[rows, start_idxs] = sampled_token_ids_np
-            self.input_batch.num_tokens[rows] = end_idxs
+            if max_end > max_model_len:
+                if num_out_tokens == 1:
+                    raise ValueError(
+                        "Sampled token IDs exceed the max model length. "
+                        f"Total number of tokens: {max_end} > max_model_len: "
+                        f"{max_model_len}"
+                    )
+                # A block canvas is physical: a bypassed request admitted with
+                # a zero-canvas budget still gets one full canvas back. Keep
+                # only the slice that fits; the scheduler's stop check then
+                # finishes the request length-capped through the normal output
+                # path instead of this raise killing the engine.
+                logger.warning(
+                    "Block canvas exceeds max_model_len=%d for request(s) %s; "
+                    "keeping only the slice that fits",
+                    max_model_len,
+                    ", ".join(
+                        self.input_batch.req_ids[i]
+                        for i in range(num_reqs)
+                        if int(end_idxs[i]) > max_model_len
+                    ),
+                )
+                end_idxs = np.maximum(np.minimum(end_idxs, max_model_len), start_idxs)
 
             for req_idx in range(num_reqs):
+                start_idx = int(start_idxs[req_idx])
+                end_idx = int(end_idxs[req_idx])
+                block = sampled_token_ids_np[req_idx][: end_idx - start_idx]
+                self.input_batch.token_ids_cpu[req_idx, start_idx:end_idx] = block
                 output_token_ids = self.input_batch.req_output_token_ids[req_idx]
                 assert output_token_ids is not None
-                output_token_ids.append(int(sampled_token_ids_np[req_idx]))
+                output_token_ids.extend(int(token_id) for token_id in block)
+            self.input_batch.num_tokens[rows] = end_idxs
             return
 
         assert req_ids is not None
         captured_req_ids = req_ids
+        if num_out_tokens == 1:
+            # Autoregressive overflow means scheduler accounting corrupted;
+            # validate every live row before mutating any of them, so the
+            # raise never leaves a partially applied batch. Block canvases
+            # are clipped below instead of raising.
+            for req_idx, req_id in enumerate(captured_req_ids):
+                req_state = self.requests.get(req_id)
+                if req_state is None:
+                    continue
+                if (
+                    request_states is not None
+                    and req_state is not request_states[req_idx]
+                ):
+                    continue
+                current_row = self.input_batch.req_id_to_index.get(req_id)
+                if current_row is not None:
+                    end_idx = (
+                        int(self.input_batch.num_tokens[current_row]) + num_out_tokens
+                    )
+                    if end_idx > max_model_len:
+                        raise ValueError(
+                            "Sampled token IDs exceed the max model length. "
+                            f"Total number of tokens: {end_idx} > max_model_len: "
+                            f"{max_model_len}"
+                        )
+
         for req_idx, req_id in enumerate(captured_req_ids):
             req_state = self.requests.get(req_id)
-            if req_state is None:
-                continue
-            if request_states is not None and req_state is not request_states[req_idx]:
+            # A deferred decode step can be applied after the engine finished
+            # and dropped its request, so a missing state is ordinary. Same for
+            # readmission under a reused id: the token has no live owner.
+            if req_state is None or (
+                request_states is not None and req_state is not request_states[req_idx]
+            ):
                 continue
 
             current_row = self.input_batch.req_id_to_index.get(req_id)
             if current_row is not None:
                 start_idx = int(self.input_batch.num_tokens[current_row])
-                end_idx = start_idx + 1
-                assert end_idx <= self.model_config.max_model_len, (
-                    "Sampled token IDs exceed the max model length. "
-                    f"Total number of tokens: {end_idx} > max_model_len: "
-                    f"{self.model_config.max_model_len}"
-                )
-                self.input_batch.token_ids_cpu[current_row, start_idx] = (
-                    sampled_token_ids_np[req_idx]
-                )
+                end_idx = start_idx + num_out_tokens
+                if end_idx > max_model_len:
+                    logger.warning(
+                        "Block canvas exceeds max_model_len=%d for request %s; "
+                        "keeping only the slice that fits",
+                        max_model_len,
+                        req_id,
+                    )
+                    end_idx = max(start_idx, max_model_len)
+                block = sampled_token_ids_np[req_idx][: end_idx - start_idx]
+                self.input_batch.token_ids_cpu[current_row, start_idx:end_idx] = block
                 self.input_batch.num_tokens[current_row] = end_idx
+            else:
+                block = sampled_token_ids_np[req_idx]
 
-            req_state.output_token_ids.append(int(sampled_token_ids_np[req_idx]))
+            req_state.output_token_ids.extend(int(token_id) for token_id in block)
 
     def apply_and_build_runner_output(
         self,

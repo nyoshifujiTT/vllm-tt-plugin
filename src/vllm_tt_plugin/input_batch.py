@@ -208,9 +208,14 @@ class InputBatch:
         block_sizes: list[int],  # The block_size of each kv cache group
         kernel_block_sizes: list[int],
         logitsprocs: LogitsProcessors | None = None,
+        disable_logprobs: bool = False,
+        output_tokens_per_step: int = 1,
     ):
         self.max_num_reqs = max_num_reqs
+        self.max_model_len = max_model_len
         self.vocab_size = vocab_size
+        self.disable_logprobs = disable_logprobs
+        self.output_tokens_per_step = output_tokens_per_step
 
         self._req_ids: list[str | None] = []
         self.req_id_to_index: dict[str, int] = {}
@@ -329,6 +334,23 @@ class InputBatch:
         sampling_params = request.sampling_params
         assert sampling_params is not None, "pooling requests not supported yet"
 
+        # Block-output models commit a full canvas per step. Keep this
+        # worker-side clamp even if a prebuilt EngineCoreRequest bypasses the
+        # frontend validation: an unaligned leftover max_tokens (for example
+        # max_model_len - prompt_len) would apply the last canvas past
+        # max_model_len and kill the engine.
+        if self.output_tokens_per_step > 1:
+            from vllm_tt_plugin.platform import _fit_block_output_max_tokens
+
+            fitted = _fit_block_output_max_tokens(
+                num_prompt_tokens,
+                sampling_params.max_tokens,
+                self.output_tokens_per_step,
+                self.max_model_len,
+            )
+            if sampling_params.max_tokens != fitted:
+                sampling_params.max_tokens = fitted
+
         # Register with batch update builder for logits processors
         self.sampling.batch_update_builder.added.append(
             (
@@ -393,8 +415,13 @@ class InputBatch:
         if request.generator is not None:
             self.sampling.generators[req_index] = request.generator
 
+        # Block-output models cannot return per-token logprobs. Keep this
+        # worker-side guard even if a prebuilt EngineCoreRequest bypasses the
+        # frontend validation.
+        if self.disable_logprobs:
+            self.sampling.num_logprobs[req_index] = LOGPROBS_NONE_SENTINEL
         # Logprobs (-1 means all vocab logprobs, remap to vocab_size)
-        if sampling_params.logprobs is not None:
+        elif sampling_params.logprobs is not None:
             self.sampling.num_logprobs[req_index] = (
                 self.vocab_size
                 if sampling_params.logprobs == -1
@@ -738,6 +765,8 @@ class TTLaneInputBatch(InputBatch):
         block_sizes: list[int],
         kernel_block_sizes: list[int],
         logitsprocs: LogitsProcessors | None = None,
+        disable_logprobs: bool = False,
+        output_tokens_per_step: int = 1,
     ):
         if num_lanes < 1 or per_lane < 1:
             raise ValueError(
@@ -754,6 +783,8 @@ class TTLaneInputBatch(InputBatch):
             block_sizes=block_sizes,
             kernel_block_sizes=kernel_block_sizes,
             logitsprocs=logitsprocs,
+            disable_logprobs=disable_logprobs,
+            output_tokens_per_step=output_tokens_per_step,
         )
         # Rows are a fixed slot grid (lane-chunked), not a front-packed list:
         # pre-size so a request can occupy any slot in its lane's chunk, with
@@ -1104,8 +1135,7 @@ class TTLaneInputBatch(InputBatch):
         return reorder_grammar_bitmask_for_tt_batch(
             bitmask=bitmask,
             structured_output_request_ids=grammar_output.structured_output_request_ids,
-            req_id_to_index=self.req_id_to_index,
-            req_indices=list(range(batch_length)),
+            row_req_ids=self.req_ids[:batch_length],
             batch_length=batch_length,
         )
 
@@ -1355,6 +1385,10 @@ class TTLaneInputBatch(InputBatch):
                 "Intermediate prefill rows must use host sampling so their "
                 "device RNG state is not advanced."
             )
+            assert model_input.grammar_bitmask[0] is None, (
+                "grammar bitmask is set but device sampling can't apply it"
+            )
+
             tokens = tt_out.reshape(-1) if isinstance(tt_out, torch.Tensor) else tt_out
             # Decode reads each scheduled slot; prefill returns one token per
             # scheduled request, already in row order.
