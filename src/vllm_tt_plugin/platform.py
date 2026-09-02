@@ -45,6 +45,21 @@ else:
 
 logger = init_tt_logger(__name__)
 
+# The TT single-process executor, a UniProcExecutor subclass that restores the
+# background decode read-back thread stock vLLM dropped in 0.24.0.
+TT_UNIPROC_EXECUTOR_BACKEND = "vllm_tt_plugin.executor.TTUniProcExecutor"
+
+
+def _is_uniproc_executor_backend(backend) -> bool:
+    """Whether ``backend`` runs the worker in the engine process.
+
+    ``None`` and ``"uni"`` are vLLM's own spellings; the TT executor is a
+    ``UniProcExecutor`` subclass, so it satisfies every constraint that asks
+    for uniproc. Checks that spell the set inline miss the subclass and reject
+    a configuration the plugin itself installed.
+    """
+    return backend in (None, "uni", TT_UNIPROC_EXECUTOR_BACKEND)
+
 _STANDARD_DP_DISCOVERY_RECV_TIMEOUT_S = 60.0
 _STANDARD_DP_DISCOVERY_JOIN_TIMEOUT_S = 5.0
 _STANDARD_DP_MESH_GRIDS_KEY = "_tt_standard_dp_mesh_grids"
@@ -1535,9 +1550,9 @@ class TTPlatform(Platform):
         # Applied only to single-process backends; "mp"/"ray" have their own
         # async output handling. Note the lane-DP hook above pins "uni", so
         # this covers lane runs too.
-        if parallel_config.distributed_executor_backend in (None, "uni"):
+        if _is_uniproc_executor_backend(parallel_config.distributed_executor_backend):
             parallel_config.distributed_executor_backend = (
-                "vllm_tt_plugin.executor.TTUniProcExecutor"
+                TT_UNIPROC_EXECUTOR_BACKEND
             )
 
         # For TT models, prepend "TT" to the architecture name,
@@ -1737,7 +1752,7 @@ class TTPlatform(Platform):
             distributed_executor_backend = getattr(
                 parallel_config, "distributed_executor_backend", None
             )
-            if distributed_executor_backend not in (None, "uni"):
+            if not _is_uniproc_executor_backend(distributed_executor_backend):
                 raise ValueError(
                     "Block-output models require the uniproc executor; "
                     f"got distributed_executor_backend="

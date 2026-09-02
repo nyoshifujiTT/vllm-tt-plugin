@@ -61,6 +61,11 @@ def _load_executor(monkeypatch):
     log_mod.init_tt_logger = lambda _n: types.SimpleNamespace(info=lambda *a, **k: None)
     monkeypatch.setitem(sys.modules, "vllm_tt_plugin.logger", log_mod)
     sys.modules.pop("vllm_tt_plugin.executor", None)
+    # The module imported below binds the stub UniProcExecutor as its base
+    # class. Leaving it in sys.modules would hand that stub-derived class to
+    # every later test, so drop it again when this test finishes; monkeypatch
+    # restores the stubbed vllm modules at the same point.
+    monkeypatch.delitem(sys.modules, "vllm_tt_plugin.executor", raising=False)
     import importlib
     mod = importlib.import_module("vllm_tt_plugin.executor")
     return mod, out_mod, serial_mod
@@ -109,3 +114,35 @@ def test_no_thread_when_async_scheduling_disabled(monkeypatch):
     # non_block with no thread -> delegate to base (inline).
     out = ex.collective_rpc("execute_model", non_block=True, single_value=True)
     assert out == ("INLINE", "execute_model")
+
+
+class TestUniprocBackendRecognition:
+    """The TT executor must satisfy checks that ask for a uniproc executor.
+
+    check_and_update_config swaps distributed_executor_backend to the TT
+    executor early, so any later constraint that spells the uniproc set inline
+    as (None, "uni") rejects a value the plugin itself installed. The
+    block-output guard did exactly that and failed 20 tests with
+    "Block-output models require the uniproc executor; got
+    distributed_executor_backend='vllm_tt_plugin.executor.TTUniProcExecutor'".
+    """
+
+    def test_vllm_spellings_are_uniproc(self):
+        from vllm_tt_plugin.platform import _is_uniproc_executor_backend
+
+        assert _is_uniproc_executor_backend(None)
+        assert _is_uniproc_executor_backend("uni")
+
+    def test_the_tt_executor_is_uniproc(self):
+        from vllm_tt_plugin.platform import (
+            TT_UNIPROC_EXECUTOR_BACKEND,
+            _is_uniproc_executor_backend,
+        )
+
+        assert _is_uniproc_executor_backend(TT_UNIPROC_EXECUTOR_BACKEND)
+
+    def test_multiprocess_backends_are_not_uniproc(self):
+        from vllm_tt_plugin.platform import _is_uniproc_executor_backend
+
+        assert not _is_uniproc_executor_backend("mp")
+        assert not _is_uniproc_executor_backend("ray")
