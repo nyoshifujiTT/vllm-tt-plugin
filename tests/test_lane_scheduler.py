@@ -8,10 +8,13 @@ on a small surface of each lane (``waiting`` / ``skipped_waiting`` / ``running``
 length, forced-mode scheduling, and ``update_from_output``).
 """
 
+import collections
 from types import SimpleNamespace
 
+import pytest
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.engine import EngineCoreOutputs
+from vllm.v1.request import RequestStatus
 
 from vllm_tt_plugin.lane_scheduler import (
     TTLaneCoordinator,
@@ -32,15 +35,28 @@ class FakeLane:
     fallback.
     """
 
-    def __init__(self, waiting=0, running=0, skipped_waiting=0, pending_finished=()):
+    def __init__(
+        self,
+        waiting=0,
+        running=0,
+        skipped_waiting=0,
+        partial_prefills=0,
+        pending_finished=(),
+        owns=(),
+    ):
         self.waiting = [object()] * waiting
         self.skipped_waiting = [object()] * skipped_waiting
-        self.running = [object()] * running
+        self.running = [
+            SimpleNamespace(is_prefill_chunk=False) for _ in range(running)
+        ] + [SimpleNamespace(is_prefill_chunk=True) for _ in range(partial_prefills)]
         self._pending_finished = set(pending_finished)
+        self.requests: dict[str, SimpleNamespace] = {}
         self._mode = TTSchedulingMode.DEFAULT
         self.scheduled_modes: list[TTSchedulingMode] = []
         self.update_calls: list[SchedulerOutput] = []
         self._eco: dict[int, EngineCoreOutputs] = {}
+        self._owned = {r.request_id: r for r in owns}
+        self.finish_calls: list[tuple] = []
 
     def set_forced_mode(self, mode):
         self._mode = mode
@@ -51,14 +67,25 @@ class FakeLane:
         self._pending_finished = set()
         out = SchedulerOutput.make_empty()
         out.finished_req_ids = set(finished)
-        if self._mode == TTSchedulingMode.DECODE_ONLY and self.running:
-            out.num_scheduled_tokens = {f"dec-{id(self)}": len(self.running)}
-            out.total_num_scheduled_tokens = len(self.running)
+        pure_decodes = [r for r in self.running if not r.is_prefill_chunk]
+        if self._mode == TTSchedulingMode.DECODE_ONLY and pure_decodes:
+            out.num_scheduled_tokens = {f"dec-{id(self)}": len(pure_decodes)}
+            out.total_num_scheduled_tokens = len(pure_decodes)
         return out
 
     def update_from_output(self, scheduler_output, model_runner_output):
         self.update_calls.append(scheduler_output)
         return self._eco
+
+    def finish_requests(self, request_ids, finished_status):
+        self.finish_calls.append((request_ids, finished_status))
+        if request_ids is None:
+            ids = list(self._owned)
+        elif isinstance(request_ids, str):
+            ids = [request_ids]
+        else:
+            ids = list(request_ids)
+        return [self._owned.pop(rid) for rid in ids if rid in self._owned]
 
 
 def _make_coordinator(lanes, *, per_lane_max=32, log_stats=False):
@@ -84,6 +111,12 @@ def _scheduled_output(req_ids):
     return out
 
 
+def _preempting_output(preempted, scheduled=()):
+    out = _scheduled_output(scheduled)
+    out.preempted_req_ids = set(preempted)
+    return out
+
+
 def test_negotiate_prefill_when_any_lane_wants_prefill():
     # Lane 1 has a queued request and nothing running -> wants prefill.
     coordinator = _make_coordinator([FakeLane(running=2), FakeLane(waiting=1)])
@@ -100,6 +133,14 @@ def test_negotiate_prefill_when_lane_has_only_grammar_blocked_request():
     # held in skipped_waiting (waiting is empty). It must still force prefill so
     # the base scheduler can revisit and promote it after the grammar is ready.
     coordinator = _make_coordinator([FakeLane(running=2), FakeLane(skipped_waiting=1)])
+    assert coordinator._negotiate_forced_mode() == TTSchedulingMode.PREFILL_ONLY
+
+
+def test_negotiate_prefill_for_running_continuation_at_lane_capacity():
+    # The lane's only work is a partial prefill occupying its one slot: nothing
+    # waiting and no spare capacity, yet only a prefill step can advance it.
+    coordinator = _make_coordinator([FakeLane(partial_prefills=1)], per_lane_max=1)
+
     assert coordinator._negotiate_forced_mode() == TTSchedulingMode.PREFILL_ONLY
 
 
@@ -154,6 +195,102 @@ def test_no_fallback_when_no_running_requests():
     assert get_tt_step_plan(output).is_decode is False
     # Only the prefill pass ran (no decode fallback).
     assert lane0.scheduled_modes == [TTSchedulingMode.PREFILL_ONLY]
+
+
+def test_no_decode_fallback_when_only_continuations_are_running():
+    # The only running request is a partial prefill. A decode step cannot
+    # advance it, so falling back to decode would just burn a step.
+    lane = FakeLane(partial_prefills=1)
+    coordinator = _make_coordinator([lane])
+
+    output = coordinator.schedule()
+
+    assert output.total_num_scheduled_tokens == 0
+    assert get_tt_step_plan(output).is_decode is False
+    assert lane.scheduled_modes == [TTSchedulingMode.PREFILL_ONLY]
+
+
+def test_preemption_in_a_discarded_prefill_pass_is_carried_to_the_decode_step():
+    # A prefill pass keeps partial prefills in ``running``, so its running loop
+    # can preempt one -- and that preemption stands even when the pass's
+    # schedule is thrown away for the decode fallback, because
+    # ``_preempt_request`` already freed the KV. Dropping the report would
+    # leave the row claimed by a request the lane has put back in its queue.
+    lane = FakeLane(running=1, partial_prefills=1)
+    coordinator = _make_coordinator([lane], per_lane_max=2)
+    coordinator._req_to_lane = {"p": 0}
+    coordinator._assign_slot("p", 0)
+    lane_schedule = lane.schedule
+
+    def _schedule():
+        out = lane_schedule()
+        if lane.scheduled_modes[-1] == TTSchedulingMode.PREFILL_ONLY:
+            out.preempted_req_ids = {"p"}
+        return out
+
+    lane.schedule = _schedule
+
+    output = coordinator.schedule()
+
+    assert lane.scheduled_modes == [
+        TTSchedulingMode.PREFILL_ONLY,
+        TTSchedulingMode.DECODE_ONLY,
+    ]
+    assert output.preempted_req_ids == {"p"}
+    assert "p" not in coordinator._req_to_row
+    assert "p" not in get_tt_step_plan(output).req_id_to_row
+
+
+def _structured_request(*, is_prefill_chunk):
+    return SimpleNamespace(
+        use_structured_output=True, is_prefill_chunk=is_prefill_chunk
+    )
+
+
+def _recording_structured_output_manager(recorded):
+    def grammar_bitmask(requests, req_ids, spec_decode_tokens):
+        recorded.append(list(req_ids))
+        return "bitmask"
+
+    return SimpleNamespace(grammar_bitmask=grammar_bitmask)
+
+
+def test_grammar_bitmask_skips_intermediate_prefill_chunks():
+    # An intermediate chunk samples no token, so giving it a bitmask row would
+    # offset every later row against the batch the runner remaps onto.
+    lane = FakeLane()
+    lane.requests = {
+        "chunk": _structured_request(is_prefill_chunk=True),
+        "decode": _structured_request(is_prefill_chunk=False),
+    }
+    coordinator = _make_coordinator([lane])
+    recorded: list[list[str]] = []
+    coordinator.structured_output_manager = _recording_structured_output_manager(
+        recorded
+    )
+
+    scheduler_output = _scheduled_output(["chunk", "decode"])
+    # The base scheduler raises the flag for "decode": a structured request that
+    # is past its prefill chunks.
+    scheduler_output.has_structured_output_requests = True
+
+    grammar_output = coordinator.get_grammar_bitmask(scheduler_output)
+
+    assert recorded == [["decode"]]
+    assert grammar_output.structured_output_request_ids == ["decode"]
+
+
+def test_grammar_bitmask_is_none_when_only_prefill_chunks_are_scheduled():
+    lane = FakeLane()
+    lane.requests = {"chunk": _structured_request(is_prefill_chunk=True)}
+    coordinator = _make_coordinator([lane])
+    recorded: list[list[str]] = []
+    coordinator.structured_output_manager = _recording_structured_output_manager(
+        recorded
+    )
+
+    assert coordinator.get_grammar_bitmask(_scheduled_output(["chunk"])) is None
+    assert recorded == []
 
 
 def test_update_from_output_routes_and_merges_per_lane():
@@ -327,6 +464,57 @@ def test_prefill_step_plan_exposes_empty_slots_without_lane_metadata():
     assert plan.prefill_empty_slots == (4,)
 
 
+def test_preempted_request_releases_its_row_to_its_lane():
+    # Lane 0 is full (capacity 2) with "a" and "b", then preempts "a" under KV
+    # pressure while decoding "b". The preempted request is neither finished nor
+    # resumed, so without an explicit release it would hold row 0 until it
+    # resumes -- yet its running slot is already back, so the lane can admit a
+    # replacement. Under --scheduling-policy priority a higher-priority arrival
+    # is admitted ahead of the preempted request and hits the empty free list.
+    lane0 = FakeLane(running=2)
+    coordinator = _make_coordinator([lane0, FakeLane()], per_lane_max=2)
+    coordinator._req_to_lane = {"a": 0, "b": 0}
+    assert coordinator._assign_slot("a", 0) == 0
+    assert coordinator._assign_slot("b", 0) == 1
+
+    lane0.schedule = lambda: _preempting_output(["a"], scheduled=["b"])
+    coordinator.schedule()
+
+    assert "a" not in coordinator._req_to_row
+    assert coordinator._free_slots_by_lane[0] == [0]
+    # The lane binding survives: the request resumes in the lane whose KV cache
+    # manager and queues still hold it.
+    assert coordinator._req_to_lane["a"] == 0
+
+    # The freed row is handed to the newcomer instead of raising "no free slot".
+    lane0.schedule = lambda: _scheduled_output(["c"])
+    coordinator._req_to_lane["c"] = 0
+    plan = get_tt_step_plan(coordinator.schedule())
+
+    assert plan.req_id_to_row["c"] == 0
+    assert "a" not in plan.req_id_to_row
+
+
+def test_preempted_and_finished_in_one_step_frees_the_row_once():
+    # A preempted request aborted in the same step is in both sets. The row must
+    # come back exactly once, or the lane's free list would hand it out twice.
+    lane0 = FakeLane(running=1)
+    coordinator = _make_coordinator([lane0, FakeLane()], per_lane_max=2)
+    coordinator._req_to_lane = {"a": 0}
+    coordinator._assign_slot("a", 0)
+
+    def _schedule():
+        out = _preempting_output(["a"])
+        out.finished_req_ids = {"a"}
+        return out
+
+    lane0.schedule = _schedule
+    coordinator.schedule()
+
+    assert coordinator._free_slots_by_lane[0] == [0, 1]
+    assert coordinator._req_to_lane == {}
+
+
 def test_per_lane_vllm_config_uses_per_lane_max_num_seqs():
     # Lanes must be constructed from a config whose max_num_seqs is the
     # *per-lane* cap, so the base scheduler derives max_num_running_reqs ==
@@ -347,3 +535,44 @@ def test_per_lane_vllm_config_uses_per_lane_max_num_seqs():
     # model sizing is left untouched (copied, not aliased/mutated).
     assert global_config.scheduler_config.max_num_seqs == 32
     assert per_lane_config.scheduler_config is not global_config.scheduler_config
+
+
+def _req(rid, client_index=0):
+    return SimpleNamespace(request_id=rid, client_index=client_index)
+
+
+@pytest.mark.parametrize(
+    "request_ids, expected_ids",
+    [
+        (None, ["a0", "a1", "b0"]),  # None -> every held request
+        (["a1", "b0", "gone"], ["a1", "b0"]),  # spans lanes; unheld id no-ops
+        ("a0", ["a0"]),  # single str id
+    ],
+)
+def test_finish_requests_returns_only_owned_no_duplicates(request_ids, expected_ids):
+    # Each lane returns only the requests it holds (a request lives in exactly one
+    # lane), so the coordinator's concatenation is the aborted set with no
+    # duplicates.
+    a0, a1, b0 = _req("a0", 0), _req("a1", 1), _req("b0", 0)
+    owned = {"a0": a0, "a1": a1, "b0": b0}
+    coordinator = _make_coordinator([FakeLane(owns=[a0, a1]), FakeLane(owns=[b0])])
+
+    aborted = coordinator.finish_requests(request_ids, RequestStatus.FINISHED_ABORTED)
+
+    assert aborted == [owned[i] for i in expected_ids]  # exact objects, in lane order
+    assert len({id(r) for r in aborted}) == len(aborted)  # no request returned twice
+
+
+def test_finish_requests_result_is_routable_per_client():
+    # The returned Requests must carry client_index so engine-core's
+    # _send_abort_outputs can notify each client. True end-to-end notification is
+    # covered device-side in tests/tt.
+    lanes = [FakeLane(owns=[_req("a", 0), _req("b", 1)]), FakeLane(owns=[_req("c", 0)])]
+    coordinator = _make_coordinator(lanes)
+
+    aborted = coordinator.finish_requests(None, RequestStatus.FINISHED_ABORTED)
+
+    by_client = collections.defaultdict(set)
+    for r in aborted:
+        by_client[r.client_index].add(r.request_id)
+    assert by_client == {0: {"a", "c"}, 1: {"b"}}

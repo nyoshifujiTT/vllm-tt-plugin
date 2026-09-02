@@ -9,6 +9,7 @@ import socket
 import subprocess
 import sys
 import weakref
+from dataclasses import dataclass, field
 
 import cloudpickle
 import yaml
@@ -16,6 +17,7 @@ from vllm.config import ParallelConfig, VllmConfig
 from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.utils.network_utils import get_ip
 from vllm.utils.system_utils import kill_process_tree
+from vllm.v1.engine.utils import CoreEngine
 from vllm.v1.executor.abstract import UniProcExecutor
 
 from vllm_tt_plugin.config import get_tt_config
@@ -24,50 +26,25 @@ from vllm_tt_plugin.logger import init_tt_logger
 logger = init_tt_logger(__name__)
 _TT_VISIBLE_DEVICES_ENV = "TT_VISIBLE_DEVICES"
 
-# ``CoreEngine`` exists on both the fork and upstream vllm==0.24.0.
-from vllm.v1.engine.utils import CoreEngine  # noqa: E402
-
-# ``CoreEngineLauncher`` / ``EngineLaunchPlan`` are the pluggable engine-core
-# launcher hooks the fork added to vLLM; they are absent from upstream
-# vllm==0.24.0. They are only exercised by the multi-host tt-run / MPI
-# data-parallel launch path (``TTCoreEngineLauncher``); single-process and
-# single-node serving never construct them. Import them when available and fall
-# back to inert base classes otherwise, so this module still imports on stock
-# vLLM. ``_HAVE_PLUGGABLE_LAUNCHER`` gates any attempt to actually use the
-# multi-host launcher.
-try:  # fork vLLM (pluggable engine-core launcher)
-    from vllm.v1.engine.utils import (  # type: ignore[attr-defined]
-        CoreEngineLauncher,
-        EngineLaunchPlan,
-    )
-
-    _HAVE_PLUGGABLE_LAUNCHER = True
-except ImportError:  # upstream vllm==0.24.0 (no pluggable launcher hook)
-    _HAVE_PLUGGABLE_LAUNCHER = False
-
+try:
+    from vllm.v1.engine.utils import CoreEngineLauncher, EngineLaunchPlan
+except ImportError:
+    # Stock upstream vLLM (0.24 and 0.25.1 alike) launches engines directly
+    # from launch_core_engines() and has no public launcher extension classes.
+    # Keep the parsing and remote entrypoint portions of this plugin importable
+    # on such builds; if a later call tries to use the absent extension point,
+    # fail explicitly rather than at module import (which would also break
+    # every DP=1 host test).
+    @dataclass
     class EngineLaunchPlan:  # type: ignore[no-redef]
-        """Inert stand-in for the fork's EngineLaunchPlan on stock vLLM.
-
-        Only instantiated on the unavailable multi-host path; defined so the
-        module (and ``TTLaunchPlan``/``TTCoreEngineLauncher`` below) still
-        import under vllm==0.24.0.
-        """
-
-        def __init__(self, *args: object, **kwargs: object) -> None:
-            raise RuntimeError(
-                "TT multi-host tt-run/MPI launch requires the fork vLLM's "
-                "pluggable engine-core launcher, which is unavailable on this "
-                "vLLM build."
-            )
+        remote_launched: bool = False
+        non_device_dp_ranks: set[int] = field(default_factory=set)
 
     class CoreEngineLauncher:  # type: ignore[no-redef]
-        """Inert stand-in for the fork's CoreEngineLauncher on stock vLLM."""
-
-        def __init__(self, *args: object, **kwargs: object) -> None:
+        def get_engines_to_handshake(self, *_args, **_kwargs):
             raise RuntimeError(
-                "TT multi-host tt-run/MPI launch requires the fork vLLM's "
-                "pluggable engine-core launcher, which is unavailable on this "
-                "vLLM build."
+                "this vLLM build does not expose the CoreEngineLauncher "
+                "extension point required by explicit tt-run/MPI launch"
             )
 
 

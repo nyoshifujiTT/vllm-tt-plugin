@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, cast
 import numpy as np
 import torch
 from vllm.sampling_params import SamplingType
+from vllm.utils.math_utils import cdiv
 from vllm.v1.outputs import LogprobsLists, LogprobsTensors
 from vllm.v1.sample.logits_processor import (
     BatchUpdateBuilder,
@@ -105,6 +106,13 @@ def apply_cached_req_state_update(
             block_ids.extend(new_ids)
 
 
+def clone_torch_generator(generator: torch.Generator) -> torch.Generator:
+    """Copy a generator so the sampler advances the copy, not the original."""
+    clone = torch.Generator(device=generator.device)
+    clone.set_state(generator.get_state())
+    return clone
+
+
 class SamplingInputBatch:
     # Default values for padding sampling parameters in decode mode.
     DEFAULTS = {
@@ -201,9 +209,14 @@ class InputBatch:
         block_sizes: list[int],  # The block_size of each kv cache group
         kernel_block_sizes: list[int],
         logitsprocs: LogitsProcessors | None = None,
+        disable_logprobs: bool = False,
+        output_tokens_per_step: int = 1,
     ):
         self.max_num_reqs = max_num_reqs
+        self.max_model_len = max_model_len
         self.vocab_size = vocab_size
+        self.disable_logprobs = disable_logprobs
+        self.output_tokens_per_step = output_tokens_per_step
 
         self._req_ids: list[str | None] = []
         self.req_id_to_index: dict[str, int] = {}
@@ -229,12 +242,14 @@ class InputBatch:
         # Block table.
         self.block_table = MultiGroupBlockTable(
             max_num_reqs=max_num_reqs,
-            max_model_len=max_model_len,
             max_num_batched_tokens=max_num_batched_tokens,
             pin_memory=False,
             device="cpu",
             block_sizes=block_sizes,
             kernel_block_sizes=kernel_block_sizes,
+            # Per-group max blocks per request; TT runs without context
+            # parallelism (cp_world_size == 1).
+            max_num_blocks=[cdiv(max_model_len, bs) for bs in block_sizes],
         )
 
         self.req_output_token_ids: list[list[int] | None] = []
@@ -242,14 +257,20 @@ class InputBatch:
         # Sampling-related.
         self.sampling = SamplingInputBatch(max_num_reqs, logitsprocs=logitsprocs)
 
-        # Slot remap for seed manager: remap[i] = j means slot i's data came
-        # from slot j after condense.  Identity when nothing moved.
+        # Condense-move remap: remap[i] = j means slot i's data came from slot j.
+        # ``condense`` is the only writer and ``TTLaneInputBatch`` overrides it to a
+        # no-op, so ``pop_slot_remap``'s one caller always reads the identity; the
+        # non-lane path resets it and uses ``_req_state_slot``, which subsumes it.
         self._slot_remap = torch.arange(max_num_reqs, dtype=torch.int32)
+
+    def reset_slot_remap(self) -> None:
+        """Drop any pending slot remap; the identity from here."""
+        self._slot_remap = torch.arange(self.max_num_reqs, dtype=torch.int32)
 
     def pop_slot_remap(self) -> torch.Tensor:
         """Return pending slot remap and reset to identity."""
         remap = self._slot_remap
-        self._slot_remap = torch.arange(self.max_num_reqs, dtype=torch.int32)
+        self.reset_slot_remap()
         return remap
 
     @property
@@ -316,6 +337,23 @@ class InputBatch:
         sampling_params = request.sampling_params
         assert sampling_params is not None, "pooling requests not supported yet"
 
+        # Block-output models commit a full canvas per step. Keep this
+        # worker-side clamp even if a prebuilt EngineCoreRequest bypasses the
+        # frontend validation: an unaligned leftover max_tokens (for example
+        # max_model_len - prompt_len) would apply the last canvas past
+        # max_model_len and kill the engine.
+        if self.output_tokens_per_step > 1:
+            from vllm_tt_plugin.platform import _fit_block_output_max_tokens
+
+            fitted = _fit_block_output_max_tokens(
+                num_prompt_tokens,
+                sampling_params.max_tokens,
+                self.output_tokens_per_step,
+                self.max_model_len,
+            )
+            if sampling_params.max_tokens != fitted:
+                sampling_params.max_tokens = fitted
+
         # Register with batch update builder for logits processors
         self.sampling.batch_update_builder.added.append(
             (
@@ -380,8 +418,13 @@ class InputBatch:
         if request.generator is not None:
             self.sampling.generators[req_index] = request.generator
 
+        # Block-output models cannot return per-token logprobs. Keep this
+        # worker-side guard even if a prebuilt EngineCoreRequest bypasses the
+        # frontend validation.
+        if self.disable_logprobs:
+            self.sampling.num_logprobs[req_index] = LOGPROBS_NONE_SENTINEL
         # Logprobs (-1 means all vocab logprobs, remap to vocab_size)
-        if sampling_params.logprobs is not None:
+        elif sampling_params.logprobs is not None:
             self.sampling.num_logprobs[req_index] = (
                 self.vocab_size
                 if sampling_params.logprobs == -1
@@ -475,7 +518,7 @@ class InputBatch:
             self.sampling.batch_update_builder.moved.append(
                 (last_req_index, empty_index, MoveDirectionality.UNIDIRECTIONAL)
             )
-            # Track for on-device seed manager slot reindexing.
+            # Condense-move tracking (see ``self._slot_remap``): the only write.
             self._slot_remap[empty_index] = self._slot_remap[last_req_index]
 
             # Swap the states.
@@ -725,6 +768,8 @@ class TTLaneInputBatch(InputBatch):
         block_sizes: list[int],
         kernel_block_sizes: list[int],
         logitsprocs: LogitsProcessors | None = None,
+        disable_logprobs: bool = False,
+        output_tokens_per_step: int = 1,
     ):
         if num_lanes < 1 or per_lane < 1:
             raise ValueError(
@@ -741,6 +786,8 @@ class TTLaneInputBatch(InputBatch):
             block_sizes=block_sizes,
             kernel_block_sizes=kernel_block_sizes,
             logitsprocs=logitsprocs,
+            disable_logprobs=disable_logprobs,
+            output_tokens_per_step=output_tokens_per_step,
         )
         # Rows are a fixed slot grid (lane-chunked), not a front-packed list:
         # pre-size so a request can occupy any slot in its lane's chunk, with
@@ -837,12 +884,15 @@ class TTLaneInputBatch(InputBatch):
     ) -> bool:
         """Apply one lane step plan to this batch and the runner's request map.
 
-        This is the lane-DP variant of ``TTModelRunner._update_states``. Unlike
-        the front-packed batch it does **not** evict merely-unscheduled
-        requests: a prefill step can leave running decodes unscheduled, and
-        freeing their stable device slot would disturb the on-device per-slot
-        seed RNG. Only finished requests, and requests resumed from preemption
-        (whose KV was rebuilt), release their slot. There is no condense.
+        The lane-DP counterpart of ``TTModelRunner._update_states``. Here a row
+        is the request's device state slot, so the request holds it for its
+        whole lifetime: being left out of a step -- as every running decode is
+        on a prefill step -- changes nothing, and ``condense`` is a no-op. A row
+        comes back only when its contents stop being authoritative: on finish,
+        and on preemption, which freed the KV and reset ``num_computed_tokens``
+        so the resume re-prefills from zero into whatever row it is given then.
+        A preempted request's ``CachedRequestState`` stays in ``requests`` for
+        that resume.
 
         ``requests`` (the runner's canonical ``req_id -> CachedRequestState``
         map) and ``encoder_cache`` are mutated in place. Placement rows come
@@ -856,6 +906,16 @@ class TTLaneInputBatch(InputBatch):
         # Finished requests release their slot.
         for req_id in scheduler_output.finished_req_ids:
             requests.pop(req_id, None)
+            if self.remove_request(req_id) is not None:
+                layout_changed = True
+
+        # Preempted requests release their row, in the same step as the
+        # coordinator returns it to the lane's free list
+        # (``TTLaneCoordinator._build_step_plan``). Both must give it up
+        # together, or the next ``add_request_to_row`` places a newcomer on top
+        # of the occupant still sitting here. ``preempted_req_ids`` is typed
+        # optional, hence the ``or ()``.
+        for req_id in scheduler_output.preempted_req_ids or ():
             if self.remove_request(req_id) is not None:
                 layout_changed = True
 
@@ -880,10 +940,11 @@ class TTLaneInputBatch(InputBatch):
                 req_state, num_computed_tokens, new_block_ids, resumed_from_preemption
             )
             if resumed_from_preemption:
-                # KV was freed and is being rebuilt; re-add fresh (drop the
-                # stale slot first). The slot may differ afterwards --
-                # acceptable under the exceptional preemption path, which
-                # re-prefills the request anyway.
+                # A resume re-places the request wherever the coordinator's free
+                # list sent it, which is rarely the row it left. That row went
+                # back when the preemption was reported, so this removal only
+                # covers a resume whose preemption never was, keeping the
+                # request off two rows at once.
                 if self.remove_request(req_id) is not None:
                     layout_changed = True
                 req_ids_to_add.append(req_id)
@@ -936,7 +997,9 @@ class TTLaneInputBatch(InputBatch):
             logit_proc.update_state(batch_update)
 
     def build_merged_sampling_metadata(
-        self, scheduled_rows: list[int] | None = None
+        self,
+        scheduled_rows: list[int] | None = None,
+        non_sampling_rows: list[int] | None = None,
     ) -> SamplingMetadata:
         """Build one :class:`SamplingMetadata` over every slot row.
 
@@ -960,6 +1023,11 @@ class TTLaneInputBatch(InputBatch):
         prefill-only step) must not have its RNG advanced, or its token stream
         would drift by one draw per step it sat out. ``None`` advances all live
         generators (whole-batch fallback / tests).
+
+        ``non_sampling_rows`` are scheduled intermediate-prefill rows: they
+        occupy a row in the fixed slot layout the sampler runs over, but their
+        token is discarded, so they are handed a generator clone and the
+        request's real RNG state stays put.
         """
         n = self.max_num_reqs
         sampling = self.sampling
@@ -1003,8 +1071,11 @@ class TTLaneInputBatch(InputBatch):
             generators = dict(sampling.generators)
         else:
             scheduled = set(scheduled_rows)
+            non_sampling = set(non_sampling_rows or ())
             generators = {
-                row: gen for row, gen in sampling.generators.items() if row in scheduled
+                row: clone_torch_generator(gen) if row in non_sampling else gen
+                for row, gen in sampling.generators.items()
+                if row in scheduled
             }
         return SamplingMetadata(
             temperature=temperature if not all_greedy else None,
@@ -1067,8 +1138,7 @@ class TTLaneInputBatch(InputBatch):
         return reorder_grammar_bitmask_for_tt_batch(
             bitmask=bitmask,
             structured_output_request_ids=grammar_output.structured_output_request_ids,
-            req_id_to_index=self.req_id_to_index,
-            req_indices=list(range(batch_length)),
+            row_req_ids=self.req_ids[:batch_length],
             batch_length=batch_length,
         )
 
@@ -1191,10 +1261,22 @@ class TTLaneInputBatch(InputBatch):
         lane_batch = self
         rows = list(plan.input_rows)
         rows_np = np.asarray(rows, dtype=np.int64)
-        input_positions = torch.from_numpy(
-            lane_batch.num_computed_tokens_cpu[rows_np].astype(np.int32)
+        input_positions_np = lane_batch.num_computed_tokens_cpu[rows_np]
+        input_positions = torch.from_numpy(input_positions_np.astype(np.int32))
+        # The generator processes ``tokens[start_pos:prompt_lens]``, so
+        # ``prompt_lens`` is the end position of the chunk scheduled this step,
+        # not the full sequence length. They coincide for an unchunked prefill.
+        chunk_lens = np.asarray(
+            [
+                scheduler_output.num_scheduled_tokens[lane_batch.req_ids[row]]
+                for row in rows
+            ],
+            dtype=np.int64,
         )
-        prompt_lens = lane_batch.num_tokens[rows_np]
+        prompt_lens = input_positions_np + chunk_lens
+        intermediate_prefill_mask = torch.from_numpy(
+            prompt_lens < lane_batch.num_tokens[rows_np]
+        )
         max_prefill = int(prompt_lens.max())
         input_tokens = lane_batch.token_ids_cpu_tensor[rows_np, :max_prefill]
 
@@ -1213,6 +1295,11 @@ class TTLaneInputBatch(InputBatch):
         perform_device_sampling = runner.check_perform_device_sampling(
             is_decode=False, has_structured_outputs=has_structured
         )
+        if intermediate_prefill_mask.any():
+            # Device sampling advances device RNG state for every row it reads,
+            # which an intermediate chunk must not do. Host sampling can hand
+            # those rows a generator clone instead.
+            perform_device_sampling = False
 
         # Device-side penalties only; host sampling rebuilds these in
         # ``build_merged_sampling_metadata`` (over the full slot batch), so
@@ -1256,6 +1343,7 @@ class TTLaneInputBatch(InputBatch):
                 if plan.prefill_empty_slots is not None
                 else None
             ),
+            intermediate_prefill_mask=intermediate_prefill_mask,
         )
 
     def extract_output(
@@ -1279,7 +1367,31 @@ class TTLaneInputBatch(InputBatch):
         """
         n = len(scheduled_rows)
         rows_t = torch.as_tensor(scheduled_rows, dtype=torch.long)
+        intermediate_rows: list[int] = []
+        # The mask is prefill-only; a decode step never carries one.
+        if not is_decode and model_input.intermediate_prefill_mask is not None:
+            mask = model_input.intermediate_prefill_mask
+            assert mask.numel() == n
+            intermediate_rows = [
+                row
+                for row, is_intermediate in zip(
+                    scheduled_rows, mask.tolist(), strict=True
+                )
+                if is_intermediate
+            ]
+            if len(intermediate_rows) == n:
+                # Nothing to sample: every row is mid-prompt. The placeholder
+                # tokens are dropped by the caller.
+                return torch.zeros((n, 1), dtype=torch.int32), None
         if model_input.perform_device_sampling:
+            assert not intermediate_rows, (
+                "Intermediate prefill rows must use host sampling so their "
+                "device RNG state is not advanced."
+            )
+            assert model_input.grammar_bitmask[0] is None, (
+                "grammar bitmask is set but device sampling can't apply it"
+            )
+
             tokens = tt_out.reshape(-1) if isinstance(tt_out, torch.Tensor) else tt_out
             # Decode reads each scheduled slot; prefill returns one token per
             # scheduled request, already in row order.
@@ -1296,7 +1408,9 @@ class TTLaneInputBatch(InputBatch):
         bitmask = model_input.grammar_bitmask[0]
         if bitmask is not None:
             runner.apply_grammar_bitmask(logits, bitmask)
-        sampling_metadata = self.build_merged_sampling_metadata(scheduled_rows)
+        sampling_metadata = self.build_merged_sampling_metadata(
+            scheduled_rows, non_sampling_rows=intermediate_rows
+        )
         sampler_output = runner.host_sampler(
             logits=logits, sampling_metadata=sampling_metadata
         )
@@ -1342,8 +1456,8 @@ class TTLaneInputBatch(InputBatch):
         sampled: torch.Tensor,
         is_decode: bool,
     ) -> LogprobsLists | None:
-        """Build logprobs for device-sampled tokens, mirroring the gather-DP
-        device logprobs path but over the scheduled slot rows."""
+        """Build logprobs for device-sampled tokens over the scheduled slot
+        rows, mirroring the runner's device logprobs path."""
         n = len(scheduled_rows)
         assert isinstance(model_input.tt_sampling_params.enable_log_probs, torch.Tensor)
         enable = model_input.tt_sampling_params.enable_log_probs
