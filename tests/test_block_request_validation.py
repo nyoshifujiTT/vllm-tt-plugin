@@ -234,6 +234,9 @@ def _config(
             original_max_model_len=None,
             max_logprobs=20,
             is_moe=False,
+            # check_and_update_config forces eager execution for the TT
+            # backend, so the fixture has to carry the flag it reads.
+            enforce_eager=False,
             generation_config="auto",
             logits_processors=None,
             get_sliding_window=lambda: None,
