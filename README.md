@@ -81,6 +81,12 @@ access to `raw.githubusercontent.com` beyond the package index. When installing
 inside a container, also set `UV_NO_CACHE=1` to keep the uv cache out of the
 image layer.
 
+`common.txt` omits `torchvision`, which vLLM imports unconditionally from
+several model and processor modules, so the script installs it separately: the
+CPU build, with `--no-deps`, at the version the tt-metal env pins alongside its
+`torch`. Environments built from tt-metal's `requirements-dev.txt` already
+carry it; the `ttnn` wheel does not declare it.
+
 To install or refresh only the plugin package:
 
 ```bash
@@ -372,7 +378,9 @@ The execution model matches TT hardware characteristics:
   mechanism (no gather/scatter; ranks are fully independent).
 
 For a deeper walk-through of the scheduling and execution model, read
-`docs/SCHEDULING.md`.
+[`docs/SCHEDULING.md`](docs/SCHEDULING.md). The model-facing rules that make
+resident async decode safe are documented in
+[`docs/DECODE_RELOAD_CONTRACT.md`](docs/DECODE_RELOAD_CONTRACT.md).
 
 ## Single-Process Galaxy Serving
 
