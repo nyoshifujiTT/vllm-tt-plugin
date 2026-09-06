@@ -1482,8 +1482,9 @@ class TTPlatform(Platform):
         # upside for TT (the compiled graph is never the hot path) and the extra
         # compilation passes (combo kernels, autotune, additional attention
         # splitting ops) measurably slow the per-step host path that drives TT
-        # dispatch. Measured on Qwen3-ASR / p150 this roughly doubled decode
-        # throughput and halved prefill latency with identical outputs. Setting
+        # dispatch. Measured on Qwen3-ASR / p150, decode trace on, conc=1:
+        # decode 2.68 -> 6.21 tok/s/user (2.3x) and prefill 3.1 s -> 1.3 s
+        # (2.4x), with the transcript identical to the golden. Setting
         # enforce_eager here (before the engine builds the compilation config)
         # is equivalent to passing --enforce-eager, so callers never have to
         # remember the flag.
@@ -1493,6 +1494,23 @@ class TTPlatform(Platform):
                 "torch.compile/CUDAGraph is unused by the ttnn hot path."
             )
             vllm_config.model_config.enforce_eager = True
+
+        # ``VllmConfig.__post_init__`` derives ``compilation_config.mode`` from
+        # ``enforce_eager`` *before* this platform hook runs, so flipping
+        # ``enforce_eager`` alone is not enough on an already-built config. Pin
+        # the compilation mode to NONE (and disable CUDA-graph capture) here so
+        # the ttnn hot path is never wrapped by a compiled/inductor graph,
+        # regardless of how the engine was invoked.
+        try:
+            from vllm.config import CompilationMode, CUDAGraphMode
+
+            vllm_config.compilation_config.mode = CompilationMode.NONE
+            vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+        except Exception:  # pragma: no cover - defensive across vLLM versions
+            logger.warning(
+                "Could not pin compilation_config.mode=NONE; relying on "
+                "enforce_eager alone.",
+            )
 
         # Device computes top-32 logprobs but the OpenAI API limits to 20
         MAX_TOP_K = 20

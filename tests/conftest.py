@@ -138,5 +138,11 @@ def vllm_config() -> SimpleNamespace:
         speculative_config=None,
         lora_config=None,
         cache_config=SimpleNamespace(enable_prefix_caching=False),
+        # VllmConfig.__post_init__ derives the compilation mode from
+        # enforce_eager before check_and_update_config runs, so flipping the
+        # flag is not enough on its own -- the platform also pins the
+        # already-built compilation_config. The fixture has to carry it, or
+        # that half of the behaviour cannot be observed.
+        compilation_config=SimpleNamespace(mode=None, cudagraph_mode=None),
         structured_outputs_config=SimpleNamespace(disable_any_whitespace=False),
     )

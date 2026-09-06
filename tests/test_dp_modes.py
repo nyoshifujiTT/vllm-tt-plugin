@@ -79,6 +79,34 @@ class TestDPModes:
 
         assert vllm_config.model_config.original_max_model_len == original_max_model_len
 
+    def test_check_and_update_config_forces_eager(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        vllm_config: SimpleNamespace,
+        dummy_model_class: type,
+    ) -> None:
+        """TT never uses vLLM's compiled graph, so the platform pins eager.
+
+        ``enforce_eager`` must be flipped on and the already-built
+        ``compilation_config`` must be pinned to a non-compiling mode, because
+        ``VllmConfig.__post_init__`` derives the compilation mode from
+        ``enforce_eager`` before this hook runs. Flipping the flag alone leaves
+        a config whose mode was already computed from the old value.
+
+        This test and the pin it covers were both added in bf6185b/47bcc8a and
+        silently lost in the first upstream merge; the branch then ran for weeks
+        with enforce_eager set but the compilation mode unpinned.
+        """
+        from vllm.config import CompilationMode, CUDAGraphMode
+
+        assert vllm_config.model_config.enforce_eager is False
+
+        self.register_dummy_model(monkeypatch, vllm_config, dummy_model_class)
+
+        assert vllm_config.model_config.enforce_eager is True
+        assert vllm_config.compilation_config.mode == CompilationMode.NONE
+        assert vllm_config.compilation_config.cudagraph_mode == CUDAGraphMode.NONE
+
     def test_update_max_model_len_syncs_worker_model_config(self) -> None:
         worker_instance = TTWorker.__new__(TTWorker)
         worker_instance.model_config = SimpleNamespace(max_model_len=262_144)
