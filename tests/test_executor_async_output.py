@@ -146,3 +146,59 @@ class TestUniprocBackendRecognition:
 
         assert not _is_uniproc_executor_backend("mp")
         assert not _is_uniproc_executor_backend("ray")
+
+
+def test_the_docstring_does_not_read_the_32_as_concurrency():
+    """[1, 1, 32, 151936] invites "so it serves 32 users". It does not.
+
+    Qwen3-ASR serves at max_num_seqs = 4. The 32 is tile_padded_batch_rows --
+    TILE_SIZE * ceil(max_batch_size / TILE_SIZE) in tt_transformers' model
+    config -- so every width from 1 to 32 pads to the same 32 rows.
+
+    That detail is load-bearing for this file's argument: because the read-back
+    costs the same regardless of concurrency, serialising it hurts most at low
+    concurrency, where there is no other work to hide it behind. Left
+    unexplained, a reader can conclude the overlap only matters for large
+    batches and drop it for a 4-way deployment.
+    """
+    import os
+
+    src = open(
+        os.path.join(os.path.dirname(__file__), "..", "src", "vllm_tt_plugin", "executor.py")
+    ).read()
+    head = src[: src.index('"""', src.index('"""') + 3)]
+    flat = " ".join(head.split())
+
+    assert "tile_padded_batch_rows" in flat, (
+        "name what the 32 actually is, or it reads as the concurrency"
+    )
+    assert "max_num_seqs = 4" in flat, "state the real serving width"
+    assert "TILE_SIZE * ceil(max_batch_size / TILE_SIZE)" in flat, (
+        "give the formula, so the 32 can be re-derived for another model"
+    )
+    # the consequence, which is why this matters here
+    assert "same at conc=1 and conc=4" in flat
+
+
+def test_the_docstring_quantifies_the_read_back():
+    """"~100 ms" is only checkable if the size it moves is stated.
+
+    [1, 1, 32, 151936] bf16 is 9.3 MiB. Without that, the reader cannot tell
+    whether 100 ms is plausible or a typo, and cannot scale it to another
+    vocabulary size.
+    """
+    import os
+
+    src = open(
+        os.path.join(os.path.dirname(__file__), "..", "src", "vllm_tt_plugin", "executor.py")
+    ).read()
+    head = src[: src.index('"""', src.index('"""') + 3)]
+    flat = " ".join(head.split())
+
+    assert "9.3 MiB" in flat, "give the transfer size behind the ~100 ms"
+    # and it must match the shape actually quoted
+    assert "[1, 1, 32, 151936]" in flat
+    mib = 1 * 1 * 32 * 151936 * 2 / 1024 / 1024
+    assert abs(mib - 9.3) < 0.05, (
+        f"the quoted size no longer matches the shape ({mib:.1f} MiB)"
+    )

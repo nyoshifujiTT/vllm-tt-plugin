@@ -6,8 +6,16 @@ Background
 ----------
 The TT decode path returns an ``AsyncModelRunnerOutput`` whose ``get_output()``
 performs the device -> host read-back of the decode logits (for Qwen3-ASR that
-is a full ``[1, 1, 32, 151936]`` bf16 tensor, ~100 ms). vLLM's async scheduling
-is meant to *overlap* that read-back with the next scheduling / device step.
+is a full ``[1, 1, 32, 151936]`` bf16 tensor -- 9.3 MiB, ~100 ms). vLLM's async
+scheduling is meant to *overlap* that read-back with the next scheduling /
+device step.
+
+The 32 is not the concurrency (Qwen3-ASR serves at ``max_num_seqs = 4``): it is
+``tile_padded_batch_rows``, i.e. ``TILE_SIZE * ceil(max_batch_size / TILE_SIZE)``
+in ``tt_transformers``' model config. Every batch width from 1 to 32 pads to the
+same 32 rows, so the read-back costs the same at conc=1 and conc=4 -- which is
+why serialising it hurts most at low concurrency, where there is nothing else
+in flight to hide it behind.
 
 Older vLLM (the fork this plugin migrated from) overlapped it by submitting
 ``get_output`` to a dedicated ``async_output_thread`` inside
