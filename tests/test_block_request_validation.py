@@ -262,6 +262,11 @@ def _config(
         diffusion_config=None,
         speculative_config=None,
         lora_config=None,
+        # VllmConfig always carries a compilation_config, and the platform
+        # pins it to a non-compiling mode. The stub omitted it and the old
+        # code hid that behind a bare `except Exception`, so these tests were
+        # exercising the failure path while claiming to exercise start-up.
+        compilation_config=SimpleNamespace(mode=None, cudagraph_mode=None),
     )
 
 
