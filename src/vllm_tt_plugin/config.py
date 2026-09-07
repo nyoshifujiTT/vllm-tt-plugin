@@ -10,6 +10,13 @@ if TYPE_CHECKING:
 
 logger = init_tt_logger(__name__)
 
+# Modalities the runner can hand to a model. Widening this set alone is not
+# enough: ``TTModelRunner._gather_multi_modal_inputs`` builds only the
+# ``pixel_values`` / ``image_grid_thw`` pair, so any other payload has no
+# kwarg to travel in. Lives here because the platform reads it too, and
+# ``model_runner`` imports ``platform``. See issue #112.
+SUPPORTED_MM_MODALITIES = frozenset({"image"})
+
 
 def _extract_tt_config(
     config: dict[str, Any], config_name: str

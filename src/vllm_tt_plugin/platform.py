@@ -1,12 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
 
+import contextlib
+import functools
 import gc
 import json
 import multiprocessing
 import os
 import sys
 import weakref
+from dataclasses import replace
 from typing import TYPE_CHECKING, ClassVar, Literal
 
 import torch
@@ -14,6 +17,7 @@ from vllm.platforms.interface import Platform, PlatformEnum
 from vllm.utils import length_from_prompt_token_ids_or_embeds
 
 from vllm_tt_plugin.config import (
+    SUPPORTED_MM_MODALITIES,
     get_tt_config,
     get_tt_data_parallel_size,
     get_tt_output_tokens_per_step,
@@ -924,6 +928,71 @@ def _install_block_output_pause_guard_patch() -> None:
         cls.pause_scheduler = _wrap(original)
 
 
+def _restrict_advertised_mm_modalities(vllm_config: "VllmConfig") -> None:
+    """Advertise to vLLM only the modalities this backend can transport.
+
+    Upstream admission is an allowlist keyed on ``supported_mm_limits``:
+    ``validate_num_items`` refuses anything absent from it with a 4xx. A model
+    may declare a modality the runner cannot carry -- Qwen3.6 implements video
+    but ``_gather_multi_modal_inputs`` has no kwarg for it -- and vLLM would
+    then admit a request that dies mid-step, taking EngineCore with it.
+
+    Wrap the model's ``ProcessingInfo`` so vLLM sees the intersection with
+    ``SUPPORTED_MM_MODALITIES``. Dropping the key rather than pinning it to
+    zero keeps upstream's "absent means unsupported" as the only rule. See
+    issue #112.
+    """
+    model_config = getattr(vllm_config, "model_config", None)
+    if model_config is None or not getattr(model_config, "is_multimodal_model", False):
+        return
+
+    from vllm.multimodal import MULTIMODAL_REGISTRY
+
+    try:
+        model_cls = MULTIMODAL_REGISTRY._get_model_cls(model_config)
+    except Exception:
+        # The arch check above this call owns resolution failures.
+        return
+
+    factories = getattr(model_cls, "_processor_factory", None)
+    info_cls = getattr(factories, "info", None)
+    if info_cls is None or getattr(info_cls, "_tt_restricts_modalities", False):
+        return
+
+    class _TTModalityRestrictedInfo(info_cls):
+        # The hook re-runs on the same class when the engine rebuilds its
+        # config in-process. The filter is idempotent, but re-wrapping is not:
+        # each pass adds an MRO level the super() chain then walks.
+        _tt_restricts_modalities = True
+
+        def get_supported_mm_limits(self):
+            limits = super().get_supported_mm_limits()
+            served = {
+                modality: limit
+                for modality, limit in limits.items()
+                if modality in SUPPORTED_MM_MODALITIES
+            }
+            dropped = sorted(set(limits) - set(served))
+            if dropped:
+                logger.warning_once(
+                    "Model declares multimodal input this backend cannot serve: "
+                    "%s. Requests carrying it are rejected; serving %s. See "
+                    "https://github.com/tenstorrent/vllm-tt-plugin/issues/112",
+                    ", ".join(dropped),
+                    ", ".join(sorted(served)) or "no multimodal input",
+                )
+            return served
+
+    # ``_build_llava_or_pixtral_hf_processor`` and friends raise
+    # ``NotImplementedError(type(info))``, so keep the identity readable. Copy
+    # what ``functools.wraps`` would rather than a hand-picked list, which
+    # already missed ``__module__``; everything else comes from the base.
+    for attr in functools.WRAPPER_ASSIGNMENTS:
+        with contextlib.suppress(AttributeError):
+            setattr(_TTModalityRestrictedInfo, attr, getattr(info_cls, attr))
+    model_cls._processor_factory = replace(factories, info=_TTModalityRestrictedInfo)
+
+
 def _iter_extra_model_bundles():
     """Yield ``(folder, arch, main_class)`` for each bundle under ``EXTRA_MODELS_DIR``.
 
@@ -1548,6 +1617,9 @@ class TTPlatform(Platform):
                 f"model: '{vllm_config.model_config.model}'. "
                 f"Available TT architectures: {tt_archs}"
             )
+
+        # After the arch resolution above, so the registry hands back the TT class.
+        _restrict_advertised_mm_modalities(vllm_config)
 
         # Setting attributes on the class level is kind of hacky, but
         # it's the only way to make validate_request depend on vllm_config
