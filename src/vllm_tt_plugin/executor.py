@@ -78,7 +78,7 @@ class TTUniProcExecutor(UniProcExecutor):
                 "UniProcExecutor)."
             )
 
-    def shutdown(self) -> None:  # pragma: no cover - lifecycle glue
+    def shutdown(self) -> None:
         thread = getattr(self, "_tt_async_output_thread", None)
         if thread is not None:
             thread.shutdown(wait=False)

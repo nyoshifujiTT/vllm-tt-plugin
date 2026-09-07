@@ -202,3 +202,122 @@ def test_the_docstring_quantifies_the_read_back():
     assert abs(mib - 9.3) < 0.05, (
         f"the quoted size no longer matches the shape ({mib:.1f} MiB)"
     )
+
+
+def test_shutdown_stops_the_background_thread(monkeypatch):
+    """A surviving worker thread keeps the engine process alive.
+
+    ThreadPoolExecutor's workers are non-daemon, so an executor that is torn
+    down without shutting the pool leaves a thread joined at interpreter exit.
+    This was marked "pragma: no cover - lifecycle glue" and had no test, even
+    though this plugin already treats shutdown paths as testable (see
+    test_worker_shutdown_closes_mesh_once_across_shutdown_and_del).
+    """
+    mod, _out, _serial = _load_executor(monkeypatch)
+    ex = mod.TTUniProcExecutor.__new__(mod.TTUniProcExecutor)
+    ex.scheduler_config = types.SimpleNamespace(async_scheduling=True)
+    ex.driver_worker = object()
+    mod.TTUniProcExecutor._init_executor(ex)
+
+    thread = ex._tt_async_output_thread
+    assert thread is not None
+    calls = []
+    thread.shutdown = lambda **kwargs: calls.append(kwargs)
+
+    ex.shutdown()
+
+    assert calls == [{"wait": False}], (
+        "the pool must be shut down, and not waited on -- shutdown runs on the "
+        "engine thread and a pending read-back would block it"
+    )
+    assert ex._tt_async_output_thread is None, (
+        "the handle must be cleared, or a second shutdown submits to a dead pool"
+    )
+
+
+def test_shutdown_is_idempotent(monkeypatch):
+    """Called twice, the second call must not touch the pool again."""
+    mod, _out, _serial = _load_executor(monkeypatch)
+    ex = mod.TTUniProcExecutor.__new__(mod.TTUniProcExecutor)
+    ex.scheduler_config = types.SimpleNamespace(async_scheduling=True)
+    ex.driver_worker = object()
+    mod.TTUniProcExecutor._init_executor(ex)
+
+    calls = []
+    ex._tt_async_output_thread.shutdown = lambda **kwargs: calls.append(kwargs)
+
+    ex.shutdown()
+    ex.shutdown()
+
+    assert len(calls) == 1, f"the pool was shut down {len(calls)} times"
+
+
+def test_shutdown_without_a_thread_is_not_an_error(monkeypatch):
+    """async_scheduling off means no pool was ever created."""
+    mod, _out, _serial = _load_executor(monkeypatch)
+    ex = mod.TTUniProcExecutor.__new__(mod.TTUniProcExecutor)
+    ex.scheduler_config = types.SimpleNamespace(async_scheduling=False)
+    ex.driver_worker = object()
+    mod.TTUniProcExecutor._init_executor(ex)
+    assert ex._tt_async_output_thread is None
+
+    ex.shutdown()  # must not raise
+
+
+def test_shutdown_calls_the_base_class_teardown(monkeypatch):
+    """Our pool is not the only thing that needs releasing.
+
+    The base executor owns the driver worker; skipping its teardown would leak
+    whatever it holds. It is called through getattr because upstream has
+    shipped UniProcExecutor without a shutdown() -- so the call has to be
+    conditional, and the conditional has to be exercised both ways.
+    """
+    mod, _out, _serial = _load_executor(monkeypatch)
+
+    base_calls = []
+    monkeypatch.setattr(
+        mod.UniProcExecutor,
+        "shutdown",
+        lambda self: base_calls.append(True),
+        raising=False,
+    )
+
+    ex = mod.TTUniProcExecutor.__new__(mod.TTUniProcExecutor)
+    ex.scheduler_config = types.SimpleNamespace(async_scheduling=True)
+    ex.driver_worker = object()
+    mod.TTUniProcExecutor._init_executor(ex)
+
+    ex.shutdown()
+
+    assert base_calls == [True], "the base class teardown must run"
+
+
+def test_shutdown_survives_a_base_class_without_one(monkeypatch):
+    """The getattr guard exists for upstream versions with no shutdown()."""
+    mod, _out, _serial = _load_executor(monkeypatch)
+    monkeypatch.delattr(mod.UniProcExecutor, "shutdown", raising=False)
+
+    ex = mod.TTUniProcExecutor.__new__(mod.TTUniProcExecutor)
+    ex.scheduler_config = types.SimpleNamespace(async_scheduling=True)
+    ex.driver_worker = object()
+    mod.TTUniProcExecutor._init_executor(ex)
+
+    ex.shutdown()  # must not raise
+    assert ex._tt_async_output_thread is None
+
+
+def test_no_lifecycle_method_is_excused_from_coverage():
+    """"pragma: no cover" on our own code is a claim, so state the rule.
+
+    shutdown() carried that marker and therefore had no test, while the same
+    file's routing logic was covered thoroughly. Keep the marker for the one
+    place it is honest -- an import fallback for vLLM versions this
+    environment cannot install -- and nowhere else in what we added.
+    """
+    import os
+
+    src_dir = os.path.join(os.path.dirname(__file__), "..", "src", "vllm_tt_plugin")
+    with open(os.path.join(src_dir, "executor.py")) as fh:
+        assert "pragma: no cover" not in fh.read(), (
+            "executor.py is host-only Python; nothing in it needs excusing"
+        )
