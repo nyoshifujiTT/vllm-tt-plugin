@@ -1501,16 +1501,24 @@ class TTPlatform(Platform):
         # the compilation mode to NONE (and disable CUDA-graph capture) here so
         # the ttnn hot path is never wrapped by a compiled/inductor graph,
         # regardless of how the engine was invoked.
+        #
+        # Only the import is allowed to fail quietly -- that is the version
+        # difference this guard was written for. Wrapping the assignments in
+        # the same try meant any failure there was reported as "could not pin"
+        # while leaving whatever had already been assigned in place: if
+        # CUDAGraphMode were the missing name, ``mode`` was already NONE and
+        # ``cudagraph_mode`` was not, and the warning described neither state.
+        # Resolve both names first, then assign both.
         try:
             from vllm.config import CompilationMode, CUDAGraphMode
-
+        except ImportError:
+            logger.warning(
+                "vllm.config has no CompilationMode/CUDAGraphMode; cannot pin "
+                "compilation_config, relying on enforce_eager alone.",
+            )
+        else:
             vllm_config.compilation_config.mode = CompilationMode.NONE
             vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
-        except Exception:  # pragma: no cover - defensive across vLLM versions
-            logger.warning(
-                "Could not pin compilation_config.mode=NONE; relying on "
-                "enforce_eager alone.",
-            )
 
         # Device computes top-32 logprobs but the OpenAI API limits to 20
         MAX_TOP_K = 20

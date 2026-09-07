@@ -107,6 +107,70 @@ class TestDPModes:
         assert vllm_config.compilation_config.mode == CompilationMode.NONE
         assert vllm_config.compilation_config.cudagraph_mode == CUDAGraphMode.NONE
 
+    def test_a_missing_compilation_mode_is_the_only_quiet_failure(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        vllm_config: SimpleNamespace,
+        dummy_model_class: type,
+    ) -> None:
+        """The guard is for the import, not for the assignments.
+
+        Both were inside one try/except Exception, so an assignment that failed
+        -- a None compilation_config, a frozen one, or only CUDAGraphMode
+        having moved -- was reported as "could not pin" too. The CUDAGraphMode
+        case was the worst: `mode` had already been set and `cudagraph_mode`
+        had not, so the config was half-pinned and the log said neither.
+
+        Pinning is worth ~2.3x on decode (2.68 -> 6.21 tok/s/user measured on
+        this model), so it losing effect quietly is a silent halving.
+        """
+        import vllm.config as vllm_config_module
+
+        # `from vllm.config import CompilationMode, CUDAGraphMode` raises
+        # ImportError when either name is absent -- so both names are resolved
+        # before anything is assigned, which is exactly the property under
+        # test. Previously the assignments shared the try, so a failure after
+        # the first one left the config half-pinned.
+        monkeypatch.delattr(vllm_config_module, "CUDAGraphMode", raising=False)
+
+        self.register_dummy_model(monkeypatch, vllm_config, dummy_model_class)
+
+        assert vllm_config.compilation_config.mode is None, (
+            "nothing may be assigned when a name cannot be resolved; a "
+            "half-pinned config is worse than an unpinned one"
+        )
+        assert vllm_config.compilation_config.cudagraph_mode is None
+        assert vllm_config.model_config.enforce_eager is True, (
+            "the documented fallback is enforce_eager alone; it must hold"
+        )
+
+    def test_the_import_failure_still_leaves_eager_on(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        vllm_config: SimpleNamespace,
+        dummy_model_class: type,
+    ) -> None:
+        """When the names are gone entirely, enforce_eager must still be set.
+
+        That is the fallback the warning claims ("relying on enforce_eager
+        alone"), and it was never checked.
+        """
+        import builtins
+
+        real_import = builtins.__import__
+
+        def _no_compilation_mode(name, globals=None, locals=None, fromlist=(), level=0):
+            if name == "vllm.config" and fromlist and "CompilationMode" in fromlist:
+                raise ImportError("no CompilationMode in this vLLM")
+            return real_import(name, globals, locals, fromlist, level)
+
+        monkeypatch.setattr(builtins, "__import__", _no_compilation_mode)
+
+        self.register_dummy_model(monkeypatch, vllm_config, dummy_model_class)
+
+        assert vllm_config.model_config.enforce_eager is True
+        assert vllm_config.compilation_config.mode is None
+
     def test_update_max_model_len_syncs_worker_model_config(self) -> None:
         worker_instance = TTWorker.__new__(TTWorker)
         worker_instance.model_config = SimpleNamespace(max_model_len=262_144)
