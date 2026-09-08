@@ -321,3 +321,87 @@ def test_no_lifecycle_method_is_excused_from_coverage():
         assert "pragma: no cover" not in fh.read(), (
             "executor.py is host-only Python; nothing in it needs excusing"
         )
+
+
+def test_a_multi_worker_result_is_wrapped_in_a_list(monkeypatch):
+    """vLLM expects one entry per worker unless single_value is set.
+
+    Every existing test passes single_value=True, so the branch that wraps
+    the read-back in a list was never exercised. Returning the bare output
+    there makes the caller's output[0] index into the object itself.
+    """
+    mod, out_mod, _serial = _load_executor(monkeypatch)
+
+    ex = mod.TTUniProcExecutor.__new__(mod.TTUniProcExecutor)
+    ex.scheduler_config = types.SimpleNamespace(async_scheduling=True)
+    ex.driver_worker = object()
+    mod.TTUniProcExecutor._init_executor(ex)
+
+    sentinel = out_mod.AsyncModelRunnerOutput()
+    sentinel.get_output = lambda: "FINALIZED"
+    monkeypatch.setattr(mod, "run_method", lambda *a, **k: sentinel)
+
+    fut = ex.collective_rpc("execute_model", non_block=True, single_value=False)
+
+    assert fut.result(timeout=5) == ["FINALIZED"], (
+        "without single_value the result must be a one-entry list"
+    )
+
+
+def test_a_plain_result_comes_back_without_the_background_thread(monkeypatch):
+    """Only an AsyncModelRunnerOutput needs finalizing.
+
+    Other non-blocking RPCs return ordinary values; they must be handed back
+    in an already-completed Future rather than submitted to the pool, which
+    would make every call pay a thread hop.
+    """
+    mod, _out, _serial = _load_executor(monkeypatch)
+
+    ex = mod.TTUniProcExecutor.__new__(mod.TTUniProcExecutor)
+    ex.scheduler_config = types.SimpleNamespace(async_scheduling=True)
+    ex.driver_worker = object()
+    mod.TTUniProcExecutor._init_executor(ex)
+
+    submitted = []
+    real_submit = ex._tt_async_output_thread.submit
+
+    def _tracking_submit(*args, **kwargs):
+        submitted.append(args)
+        return real_submit(*args, **kwargs)
+
+    ex._tt_async_output_thread.submit = _tracking_submit
+    monkeypatch.setattr(mod, "run_method", lambda *a, **k: "PLAIN")
+
+    single = ex.collective_rpc("ping", non_block=True, single_value=True)
+    listed = ex.collective_rpc("ping", non_block=True, single_value=False)
+
+    assert single.done() and single.result() == "PLAIN"
+    assert listed.done() and listed.result() == ["PLAIN"]
+    assert not submitted, "a plain result must not go through the worker thread"
+
+
+def test_a_failing_rpc_surfaces_through_the_future(monkeypatch):
+    """The engine reads the Future; an exception has to reach it.
+
+    Swallowing it would leave the caller waiting on a Future that never
+    resolves, or reading a result that was never produced.
+    """
+    import pytest
+
+    mod, _out, _serial = _load_executor(monkeypatch)
+
+    ex = mod.TTUniProcExecutor.__new__(mod.TTUniProcExecutor)
+    ex.scheduler_config = types.SimpleNamespace(async_scheduling=True)
+    ex.driver_worker = object()
+    mod.TTUniProcExecutor._init_executor(ex)
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("worker exploded")
+
+    monkeypatch.setattr(mod, "run_method", _boom)
+
+    fut = ex.collective_rpc("execute_model", non_block=True, single_value=True)
+
+    assert fut.done(), "a failure must resolve the Future, not leave it pending"
+    with pytest.raises(RuntimeError, match="worker exploded"):
+        fut.result()
