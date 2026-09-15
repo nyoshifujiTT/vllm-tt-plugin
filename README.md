@@ -308,12 +308,35 @@ Common options:
 | `trace_region_size` | Trace region size for TT runtime tracing. |
 | `worker_l1_size` | Worker L1 size override. |
 | `l1_small_size` | Small L1 size override. |
-| `fabric_config` | Fabric config such as `DISABLED`, `FABRIC_1D`, `FABRIC_2D`, `FABRIC_1D_RING`, `FABRIC_2D_TORUS_XY`, or `CUSTOM`. Any `ttnn.FabricConfig` name is accepted. Defaults: Wormhole Galaxy `FABRIC_1D_RING`, Blackhole Galaxy `FABRIC_2D_TORUS_XY`, other multi-device `FABRIC_1D`. |
+| `fabric_config` | Fabric config such as `DISABLED`, `FABRIC_1D`, `FABRIC_2D`, `FABRIC_1D_RING`, `FABRIC_2D_TORUS_XY`, or `CUSTOM`. Any `ttnn.FabricConfig` name is accepted. Overrides model defaults; otherwise defaults to Wormhole Galaxy `FABRIC_1D_RING`, Blackhole Galaxy `FABRIC_2D_TORUS_XY`, other multi-device `FABRIC_1D`. |
 | `fabric_reliability_mode` | Fabric reliability mode, such as `STRICT_INIT` or `RELAXED_INIT`. |
 | `dispatch_core_axis` | Dispatch core axis, `row` or `col`. |
 | `always_compat_sampling` | Use vLLM's LogitProcessor and sampler path even when not required by the batch. Default: `false`. |
 | `optimizations` | Select model/runtime optimization profile, such as `accuracy` or `performance`. |
 | `register_test_models` | Register non-production TT test models for infrastructure tests. Default: `false`. |
+
+### Model Fabric Configuration
+
+A model class may declare `model_capabilities["fabric_config"]` as a dictionary
+of keyword arguments to `ttnn.set_fabric_config`, using TTNN enums and config
+objects directly. For example:
+
+```python
+model_capabilities = {
+    "fabric_config": {
+        "config": ttnn.FabricConfig.FABRIC_1D_RING,
+        "num_planes": 2,
+    },
+}
+```
+
+The worker applies hardware defaults, then the model's dictionary, then explicit
+`fabric_config` and `fabric_reliability_mode` launch overrides. It forwards the
+result with `ttnn.set_fabric_config(**fabric_kwargs)` before opening the mesh.
+Any TTNN fabric argument is supported, including `router_config`; TTNN validates
+the arguments. The plugin does not mutate the model's dictionary or store its
+TTNN objects in the serialized vLLM configuration. Single-device meshes do not
+initialize fabric. Models without this capability keep the hardware defaults.
 
 ### `max_model_len` And KV Cache Capacity
 
@@ -360,9 +383,11 @@ selects the TT-owned runtime classes through vLLM's extension points:
 The execution model matches TT hardware characteristics:
 
 - A TT step is either prefill-only or decode-only.
-- Token-chunked prefill is available for Gemma 4: a long prompt is split across
+- Token-chunked prefill is available to any model whose tt-metal class declares
+  `model_capabilities['supports_chunked_prefill']`: a long prompt is split across
   prefill steps and only the chunk that completes the prompt emits a token.
-  Every other model type keeps prefill unsplit.
+  Today that is the `tt_transformers` Llama, Qwen and Mistral text bridges plus
+  Gemma 4. Every other model keeps prefill unsplit.
 - Async scheduling overlaps decode submission with host-side scheduling when
   the model declares support.
 - For Galaxy-generator models (Llama3 70B, Qwen3-32B) and GPT-OSS,
@@ -464,8 +489,16 @@ clear error before anything reaches the device:
   internal implementation, not exposed at the vLLM level.
 - Speculative decoding is not currently supported.
 - LoRA is not currently supported.
-- Chunked prefill is disabled for every model type except Gemma 4, and
-  `max_num_batched_tokens` is bumped to `max_model_len` when it is disabled.
+- Chunked prefill is gated on the model's declared capability, not on a
+  `model_type` allowlist. vLLM enables it by default; pass
+  `--no-enable-chunked-prefill` to opt out. When it stays on,
+  `max_num_batched_tokens` is left as vLLM set it (2048 for `vllm serve` /
+  `server_example_tt.py`, 8192 for `LLM()`, or an explicit
+  `--max-num-batched-tokens`). When it is disabled, a budget smaller than
+  `max_model_len` is raised to `max_model_len` so a full prompt still fits in
+  one step. Resume offsets need an alignment that depends on the model's
+  program config and on the length of each remaining span, and the tt-metal
+  generator corrects them itself.
 - Where chunked prefill is active, multimodal inputs are never split across a
   chunk boundary.
 - Prompt logprobs are rejected at request validation time.
