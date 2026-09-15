@@ -328,9 +328,18 @@ class TTModelRunner:
         )
 
     def get_supported_generation_tasks(self) -> list[GenerationTask]:
-        # TT backend currently supports text generation only.
-        # (No transcription support yet.)
-        return ["generate"]
+        # TT backend supports text generation, plus transcription for models
+        # that implement SupportsTranscription (e.g. Qwen3-ASR). Mirror the GPU
+        # runner: inspect the (loaded) model instance for supports_transcription.
+        from vllm.model_executor.models import supports_transcription
+
+        tasks: list[GenerationTask] = ["generate"]
+        model = getattr(self, "model", None)
+        if model is not None and supports_transcription(model):
+            if getattr(model, "supports_transcription_only", False):
+                return ["transcription"]
+            tasks.append("transcription")
+        return tasks
 
     def get_supported_pooling_tasks(self) -> list[PoolingTask]:
         # TT backend does not support pooling/embedding tasks yet.
@@ -783,9 +792,9 @@ class TTModelRunner:
         self.input_batch.refresh_logitsprocs()
 
     def _validate_mm_feature(self, mm_feature: MultiModalFeatureSpec) -> None:
-        """Validate the multimodal feature is an image."""
-        if mm_feature.modality != "image":
-            raise NotImplementedError("Only images are supported for now")
+        """Validate the multimodal feature is an image or audio."""
+        if mm_feature.modality not in ("image", "audio"):
+            raise NotImplementedError("Only image and audio modalities are supported")
 
     def _gather_multi_modal_inputs(
         self, req_indices: list[int] | None = None
@@ -793,18 +802,19 @@ class TTModelRunner:
         """
         Gather and batch multi-modal inputs for the current persistent batch.
 
-        Currently only supports image inputs in the "pixel_values" and
-        "image_grid_thw" fields.
+        Supports image inputs ("pixel_values" / "image_grid_thw") and audio
+        inputs ("input_audio_features" / "audio_feature_lengths").
 
-        Returns a dict with keys "pixel_values" and "image_grid_thw".
+        Returns a dict with those four keys.
         Each value is a list aligned with the persistent batch order
         (`self.input_batch.req_ids[:num_reqs]`).
 
         For request i:
         - If it has no `mm_features`, the entry is None.
         - Otherwise the entry is a list aligned with that request's
-          `mm_features` (currently only images), where each element is a
-          tensor (or None if that feature has no data).
+          `mm_features` for that modality, where each element is a tensor (or
+          None if that feature has no data). A modality the request does not
+          use is None rather than an empty list.
 
         Example (3 scheduled requests: text-only, 1 image, 2 images):
         {
@@ -824,6 +834,8 @@ class TTModelRunner:
         multi_modal_kwargs: dict[str, Any] = {
             "pixel_values": [],
             "image_grid_thw": [],
+            "input_audio_features": [],
+            "audio_feature_lengths": [],
         }
 
         if req_indices is None:
@@ -837,24 +849,45 @@ class TTModelRunner:
             if not req_state.mm_features:
                 multi_modal_kwargs["pixel_values"].append(None)
                 multi_modal_kwargs["image_grid_thw"].append(None)
+                multi_modal_kwargs["input_audio_features"].append(None)
+                multi_modal_kwargs["audio_feature_lengths"].append(None)
                 continue
 
             pv_array: list[torch.Tensor | None] = []
             image_grid_thw_array: list[torch.Tensor | None] = []
+            audio_feat_array: list[torch.Tensor | None] = []
+            audio_len_array: list[torch.Tensor | None] = []
             for mm_feature in req_state.mm_features:
                 self._validate_mm_feature(mm_feature)
                 item = mm_feature.data
                 if item is None:
                     pv_array.append(None)
                     image_grid_thw_array.append(None)
+                    audio_feat_array.append(None)
+                    audio_len_array.append(None)
                     continue
-                pv_array.append(item["pixel_values"].data)
-                image_grid_thw_array.append(
-                    item["image_grid_thw"].data if "image_grid_thw" in item else None
-                )
+                if mm_feature.modality == "audio":
+                    audio_feat_array.append(item["input_audio_features"].data)
+                    audio_len_array.append(
+                        item["audio_feature_lengths"].data
+                        if "audio_feature_lengths" in item
+                        else None
+                    )
+                else:
+                    pv_array.append(item["pixel_values"].data)
+                    image_grid_thw_array.append(
+                        item["image_grid_thw"].data
+                        if "image_grid_thw" in item
+                        else None
+                    )
 
-            multi_modal_kwargs["pixel_values"].append(pv_array)
-            multi_modal_kwargs["image_grid_thw"].append(image_grid_thw_array)
+            # An audio-only request contributes no image entries and vice
+            # versa; pass None rather than an empty list so the adapter can tell
+            # "this modality was absent" from "present but empty".
+            multi_modal_kwargs["pixel_values"].append(pv_array or None)
+            multi_modal_kwargs["image_grid_thw"].append(image_grid_thw_array or None)
+            multi_modal_kwargs["input_audio_features"].append(audio_feat_array or None)
+            multi_modal_kwargs["audio_feature_lengths"].append(audio_len_array or None)
 
         return multi_modal_kwargs
 
@@ -1932,6 +1965,10 @@ class TTModelRunner:
         # Always host-only sampling params: min_p, bad_words, logit_bias,
         # allowed_token_ids, min_tokens require host sampling.
         input_batch = self.input_batch
+        if not input_batch.no_penalties and not self.model.model_capabilities.get(
+            "supports_device_penalties", True
+        ):
+            return False
         has_always_host_only_sampling_params = (
             not input_batch.no_allowed_token_ids  # allowed_token_ids set
             or input_batch.sampling.bad_words_token_ids  # bad_words set
@@ -2603,12 +2640,12 @@ class TTModelRunner:
         return runner_output
 
     def warmup_model(self) -> None:
-        # Two-phase warmup: compile first, then capture traces.
+        # Two-phase warmup: eager preparation, then trace-enabled warmup.
         #
-        # Phase 1 compiles all op variants (prefill + decode) into the
-        # program cache WITHOUT capturing any traces.  Phase 2 then
-        # captures traces with every op already compiled, so no new
-        # kernel-cache allocations occur that could corrupt trace memory.
+        # Phase 1 warms the eager prefill/decode paths without capturing
+        # traces. Generators own preparation of the programs and persistent
+        # buffers their traces need. Keep prefill first in Phase 2 because
+        # some custom adapters defer its preparation to that call.
         #
         # Assumptions / limitations:
         #   1. Traced and non-traced code paths must use the same ops.
@@ -2637,7 +2674,9 @@ class TTModelRunner:
             can_sample_on_device=sample_on_device_mode in ("all", "decode_only"),
         )
 
-        # Phase 1: compile all code paths (no trace capture)
+        # Phase 1: eager warmup (no trace capture). tt-metal #55343 also
+        # stages generic decode trace inputs here, using the profiled
+        # num_blocks above, so Phase 2 can reuse their device allocations.
         self.model.warmup_model_prefill(enable_trace=False, **prefill_kwargs)
         self.model.warmup_model_decode(enable_trace=False, **decode_kwargs)
 
@@ -2645,7 +2684,12 @@ class TTModelRunner:
         if hasattr(self.model, "already_warmed_up_prefill"):
             self.model.already_warmed_up_prefill = False
 
-        # Phase 2: capture traces (all ops already compiled)
+        # Phase 2: capture prefill before decode. Custom adapters such as
+        # Qwen can defer persistent prefill allocations / compilation until
+        # this trace-enabled warmup; they must not run behind decode traces.
+        # Generic decode inputs are already staged by tt-metal #55343, so
+        # restoring this order does not require allocating them after prefill
+        # capture. Older tt-metal revisions lack that protection (see #122).
         if trace_prefill_mode:
             self.model.warmup_model_prefill(enable_trace=True, **prefill_kwargs)
         if trace_decode_mode:

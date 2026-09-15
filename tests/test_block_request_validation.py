@@ -234,6 +234,9 @@ def _config(
             original_max_model_len=None,
             max_logprobs=20,
             is_moe=False,
+            # check_and_update_config forces eager execution for the TT
+            # backend, so the fixture has to carry the flag it reads.
+            enforce_eager=False,
             generation_config="auto",
             logits_processors=None,
             get_sliding_window=lambda: None,
@@ -259,6 +262,11 @@ def _config(
         diffusion_config=None,
         speculative_config=None,
         lora_config=None,
+        # VllmConfig always carries a compilation_config, and the platform
+        # pins it to a non-compiling mode. The stub omitted it and the old
+        # code hid that behind a bare `except Exception`, so these tests were
+        # exercising the failure path while claiming to exercise start-up.
+        compilation_config=SimpleNamespace(mode=None, cudagraph_mode=None),
     )
 
 

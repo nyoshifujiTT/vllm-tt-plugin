@@ -45,6 +45,21 @@ else:
 
 logger = init_tt_logger(__name__)
 
+# The TT single-process executor, a UniProcExecutor subclass that restores the
+# background decode read-back thread stock vLLM dropped in 0.24.0.
+TT_UNIPROC_EXECUTOR_BACKEND = "vllm_tt_plugin.executor.TTUniProcExecutor"
+
+
+def _is_uniproc_executor_backend(backend) -> bool:
+    """Whether ``backend`` runs the worker in the engine process.
+
+    ``None`` and ``"uni"`` are vLLM's own spellings; the TT executor is a
+    ``UniProcExecutor`` subclass, so it satisfies every constraint that asks
+    for uniproc. Checks that spell the set inline miss the subclass and reject
+    a configuration the plugin itself installed.
+    """
+    return backend in (None, "uni", TT_UNIPROC_EXECUTOR_BACKEND)
+
 _STANDARD_DP_DISCOVERY_RECV_TIMEOUT_S = 60.0
 _STANDARD_DP_DISCOVERY_JOIN_TIMEOUT_S = 5.0
 _STANDARD_DP_MESH_GRIDS_KEY = "_tt_standard_dp_mesh_grids"
@@ -1058,10 +1073,15 @@ def register_tt_models(register_test_models=False) -> None:
         path_llama_text = (
             "models.demos.t3000.llama2_70b.tt.generator_vllm:TtLlamaForCausalLM"
         )
+    elif llama_text_version == "llama31_8b_qb2":
+        path_llama_text = (
+            "models.demos.llama31_8b_qb2.tt.generator_vllm:LlamaForCausalLM"
+        )
     else:
         raise ValueError(
             f"Unsupported TT Llama version: {llama_text_version}, "
-            "pick one of [tt_transformers, llama3_70b_galaxy, llama2_70b]"
+            "pick one of [tt_transformers, llama3_70b_galaxy, "
+            "llama2_70b, llama31_8b_qb2]"
         )
 
     # Llama3.1/3.2 - Text
@@ -1122,6 +1142,13 @@ def register_tt_models(register_test_models=False) -> None:
         ModelRegistry,
         "TTQwen3VLForConditionalGeneration",
         "models.demos.qwen3_vl.tt.generator_vllm:Qwen3VLForConditionalGeneration",
+    )
+
+    # Qwen3-ASR - Audio (speech-to-text / transcription)
+    _register_model_if_missing(
+        ModelRegistry,
+        "TTQwen3ASRForConditionalGeneration",
+        "models.demos.audio.qwen3_asr.tt.generator_vllm:TTQwen3ASRForConditionalGeneration",
     )
 
     # Mistral - Text only
@@ -1479,6 +1506,50 @@ class TTPlatform(Platform):
         ), "TT backend does not support distributed execution"
         assert not vllm_config.lora_config, "LoRA is not supported for TT backend"
 
+        # Force eager execution: the TT backend runs the model through tt-metal
+        # (ttnn) inside the TT model runner, not through vLLM's torch.compile /
+        # Inductor / CUDA-graph pipeline. Leaving vLLM compilation enabled has no
+        # upside for TT (the compiled graph is never the hot path) and the extra
+        # compilation passes (combo kernels, autotune, additional attention
+        # splitting ops) measurably slow the per-step host path that drives TT
+        # dispatch. Measured on Qwen3-ASR / p150, decode trace on, conc=1:
+        # decode 2.68 -> 6.21 tok/s/user (2.3x) and prefill 3.1 s -> 1.3 s
+        # (2.4x), with the transcript identical to the golden. Setting
+        # enforce_eager here (before the engine builds the compilation config)
+        # is equivalent to passing --enforce-eager, so callers never have to
+        # remember the flag.
+        if not vllm_config.model_config.enforce_eager:
+            logger.info(
+                "TT backend forces eager execution (enforce_eager=True); vLLM "
+                "torch.compile/CUDAGraph is unused by the ttnn hot path."
+            )
+            vllm_config.model_config.enforce_eager = True
+
+        # ``VllmConfig.__post_init__`` derives ``compilation_config.mode`` from
+        # ``enforce_eager`` *before* this platform hook runs, so flipping
+        # ``enforce_eager`` alone is not enough on an already-built config. Pin
+        # the compilation mode to NONE (and disable CUDA-graph capture) here so
+        # the ttnn hot path is never wrapped by a compiled/inductor graph,
+        # regardless of how the engine was invoked.
+        #
+        # Only the import is allowed to fail quietly -- that is the version
+        # difference this guard was written for. Wrapping the assignments in
+        # the same try meant any failure there was reported as "could not pin"
+        # while leaving whatever had already been assigned in place: if
+        # CUDAGraphMode were the missing name, ``mode`` was already NONE and
+        # ``cudagraph_mode`` was not, and the warning described neither state.
+        # Resolve both names first, then assign both.
+        try:
+            from vllm.config import CompilationMode, CUDAGraphMode
+        except ImportError:
+            logger.warning(
+                "vllm.config has no CompilationMode/CUDAGraphMode; cannot pin "
+                "compilation_config, relying on enforce_eager alone.",
+            )
+        else:
+            vllm_config.compilation_config.mode = CompilationMode.NONE
+            vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+
         # Device computes top-32 logprobs but the OpenAI API limits to 20
         MAX_TOP_K = 20
 
@@ -1522,6 +1593,23 @@ class TTPlatform(Platform):
         parallel_config = vllm_config.parallel_config
         if parallel_config.worker_cls == "auto":
             parallel_config.worker_cls = "vllm_tt_plugin.worker.TTWorker"
+
+        # Restore decode read-back overlap for the single-process path. Stock
+        # vLLM's ``UniProcExecutor`` finalizes an ``AsyncModelRunnerOutput``
+        # (the TT decode device->host read-back) inline on the engine thread;
+        # the fork this plugin came from offloaded it to a background thread so
+        # it overlapped the next scheduling/device step. Inline finalization
+        # serializes every TT decode behind its own read-back (~100 ms for a
+        # [1, 1, 32, 151936] bf16 logit tensor). ``TTUniProcExecutor`` is a
+        # ``UniProcExecutor`` subclass that re-adds that background thread.
+        #
+        # Applied only to single-process backends; "mp"/"ray" have their own
+        # async output handling. Note the lane-DP hook above pins "uni", so
+        # this covers lane runs too.
+        if _is_uniproc_executor_backend(parallel_config.distributed_executor_backend):
+            parallel_config.distributed_executor_backend = (
+                TT_UNIPROC_EXECUTOR_BACKEND
+            )
 
         # For TT models, prepend "TT" to the architecture name,
         # e.g. "TTLlamaForCausalLM"
@@ -1724,7 +1812,7 @@ class TTPlatform(Platform):
             distributed_executor_backend = getattr(
                 parallel_config, "distributed_executor_backend", None
             )
-            if distributed_executor_backend not in (None, "uni"):
+            if not _is_uniproc_executor_backend(distributed_executor_backend):
                 raise ValueError(
                     "Block-output models require the uniproc executor; "
                     f"got distributed_executor_backend="

@@ -111,6 +111,9 @@ def vllm_config() -> SimpleNamespace:
             # Seeded with vLLM's own default so the assertions below catch a
             # plugin-side override rather than the absence of one.
             dp_engine_core_proc_cls="vllm.v1.engine.core.DPEngineCoreProc",
+            # check_and_update_config swaps in TTUniProcExecutor for
+            # single-process backends, so it reads this field.
+            distributed_executor_backend=None,
         ),
         model_config=SimpleNamespace(
             model="dummy",
@@ -119,6 +122,9 @@ def vllm_config() -> SimpleNamespace:
             max_model_len=4,
             original_max_model_len=None,
             is_moe=False,
+            # check_and_update_config forces eager execution for the TT
+            # backend, so the fixture has to carry the flag it reads.
+            enforce_eager=False,
             get_sliding_window=lambda: None,
         ),
         scheduler_config=SimpleNamespace(
@@ -132,5 +138,11 @@ def vllm_config() -> SimpleNamespace:
         speculative_config=None,
         lora_config=None,
         cache_config=SimpleNamespace(enable_prefix_caching=False),
+        # VllmConfig.__post_init__ derives the compilation mode from
+        # enforce_eager before check_and_update_config runs, so flipping the
+        # flag is not enough on its own -- the platform also pins the
+        # already-built compilation_config. The fixture has to carry it, or
+        # that half of the behaviour cannot be observed.
+        compilation_config=SimpleNamespace(mode=None, cudagraph_mode=None),
         structured_outputs_config=SimpleNamespace(disable_any_whitespace=False),
     )

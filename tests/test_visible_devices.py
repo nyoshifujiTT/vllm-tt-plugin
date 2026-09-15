@@ -51,6 +51,8 @@ def _discovered_groups_config(
         parallel_config=SimpleNamespace(
             assigned_physical_gpu_ids=assigned_physical_gpu_ids,
             data_parallel_rank_local=local_dp_rank,
+            # read by the TTUniProcExecutor swap in check_and_update_config
+            distributed_executor_backend=None,
         ),
     )
 
