@@ -502,3 +502,110 @@ def test_worker_sample_tokens_rejected_for_pooling():
     # opaque AttributeError on the sampling-free pooling runner.
     with pytest.raises(RuntimeError, match="not applicable to pooling"):
         TTWorker.sample_tokens(worker, grammar_output=None)
+
+
+class _DeviceHiddenModel:
+    """A model that can leave its per-token hidden states on device.
+
+    Returns one device tensor per request rather than a single concatenated
+    host tensor -- concatenating on the token axis would mean composing on
+    host, which is the copy the device path exists to avoid.
+    """
+
+    def __init__(self, width: int):
+        self.width = width
+        self.seen_keep_on_device = None
+        self.pooler = _PerRequestDevicePooler(width)
+
+    def forward(
+        self,
+        input_ids,
+        attention_mask,
+        return_full_hidden_states=False,
+        keep_hidden_states_on_device=False,
+    ):
+        self.seen_keep_on_device = keep_hidden_states_on_device
+        batch = input_ids.shape[0]
+        if keep_hidden_states_on_device:
+            return [_FakeTTNNHidden(rows=input_ids.shape[1]) for _ in range(batch)]
+        out = torch.arange(1, batch + 1, dtype=torch.float32).reshape(batch, 1)
+        return out.expand(batch, self.width).contiguous()
+
+
+class _PerRequestDevicePooler:
+    """Pools a list of per-request device tensors, one row each."""
+
+    def __init__(self, width: int):
+        self.width = width
+        self.seen_kind = None
+
+    def get_supported_tasks(self):
+        return ("embed",)
+
+    def __call__(self, hidden_states, pooling_metadata):
+        self.seen_kind = type(hidden_states)
+        assert isinstance(hidden_states, list), hidden_states
+        # One vector per request, already host by the time the pooler returns.
+        return [torch.ones(self.width) for _ in hidden_states]
+
+
+def test_runner_asks_a_capable_model_to_keep_hidden_states_on_device():
+    """The copy a device pooler does not need should not be made.
+
+    Checked on the capability decision itself rather than through
+    ``execute_model``: building a real ``PoolingMetadata`` cursor needs pinned
+    host memory, which a CPU-only container cannot provide, and that would make
+    this assertion fail for an unrelated reason.
+    """
+    runner = _bare_runner()
+    runner.model = _DeviceHiddenModel(width=4)
+
+    assert runner._device_hidden_kwargs() == {"keep_hidden_states_on_device": True}
+
+
+def test_a_capable_models_device_tensors_reach_its_pooler_unconcatenated():
+    """One tensor per request, not a concatenation composed on host."""
+    model = _DeviceHiddenModel(width=4)
+    tokens = torch.zeros((2, 3), dtype=torch.int64)
+
+    hidden = model.forward(
+        input_ids=tokens,
+        attention_mask=torch.ones((2, 3)),
+        return_full_hidden_states=True,
+        **{"keep_hidden_states_on_device": True},
+    )
+
+    assert isinstance(hidden, list) and len(hidden) == 2
+    pooled = model.pooler(hidden, pooling_metadata=None)
+    assert model.pooler.seen_kind is list
+    assert len(pooled) == 2 and all(v.shape == (4,) for v in pooled)
+
+
+def test_a_model_without_the_parameter_keeps_the_host_composition():
+    """Opt-in by capability: an unaware model must be unaffected.
+
+    ``_FakeModel.forward`` has no ``keep_hidden_states_on_device`` parameter, so
+    passing it would raise TypeError; the runner must not pass it at all.
+    """
+    runner = _bare_runner()
+    runner.model = _FakeModel(width=4)
+
+    assert runner._device_hidden_kwargs() == {}
+
+
+def test_an_unintrospectable_forward_is_treated_as_incapable():
+    """A C-implemented forward cannot be inspected; fall back, do not crash."""
+    runner = _bare_runner()
+    model = _FakeModel(width=4)
+    # A builtin has no Python signature.
+    model.forward = len
+    runner.model = model
+
+    assert runner._device_hidden_kwargs() == {}
+
+
+def test_a_missing_forward_is_treated_as_incapable():
+    runner = _bare_runner()
+    runner.model = object()
+
+    assert runner._device_hidden_kwargs() == {}

@@ -25,6 +25,7 @@ so it can be exercised without a device by substituting a fake model.
 
 from __future__ import annotations
 
+import inspect
 from typing import TYPE_CHECKING
 
 import torch
@@ -178,6 +179,31 @@ class TTPoolingModelRunner:
             attention_mask[i, :seq_len] = 1.0
         return tokens, attention_mask, req_data_list
 
+    def _device_hidden_kwargs(self) -> dict:
+        """Ask the model to leave its hidden states on device, if it can.
+
+        A pooler that runs on device reads one row per request out of the hidden
+        states, so composing them on host first copies the whole ``[seq, dim]``
+        of every request to feed a layer that wants a row of it. A model that
+        accepts ``keep_hidden_states_on_device`` can skip that copy and hand the
+        device tensors straight through to its pooler.
+
+        Opt-in by capability rather than by model name: a model whose forward has
+        no such parameter keeps the host composition, so this is transparent to
+        every model that has not implemented it.
+        """
+        forward = getattr(self.model, "forward", None)
+        if forward is None:
+            return {}
+        try:
+            parameters = inspect.signature(forward).parameters
+        except (TypeError, ValueError):
+            # A C-implemented or otherwise unintrospectable forward: assume not.
+            return {}
+        if "keep_hidden_states_on_device" not in parameters:
+            return {}
+        return {"keep_hidden_states_on_device": True}
+
     @torch.no_grad()
     def execute_model(
         self,
@@ -214,6 +240,7 @@ class TTPoolingModelRunner:
             input_ids=tokens,
             attention_mask=attention_mask,
             return_full_hidden_states=True,
+            **self._device_hidden_kwargs(),
         )
         # Pooling contract: pooling directives (normalize, activation, pooling
         # type, ...) are the responsibility of the model's ``pooler`` component,
@@ -319,7 +346,14 @@ class TTPoolingModelRunner:
         # See "Device tolerance" above: use the tensor's torch device when it has
         # one (embedding path unchanged), else build the cursor on CPU for a
         # device-native (ttnn) hidden whose pooler indexes on device itself.
-        hidden_device = getattr(hidden_states, "device", None)
+        # A model may also hand back one device tensor per request instead of a
+        # single concatenated one; there is no tensor to read a device off, and
+        # its pooler indexes per request, so the cursor goes on CPU as well.
+        hidden_device = (
+            None
+            if isinstance(hidden_states, (list, tuple))
+            else getattr(hidden_states, "device", None)
+        )
         cursor_device = (
             hidden_device
             if isinstance(hidden_device, torch.device)
